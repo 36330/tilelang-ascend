@@ -71,11 +71,12 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Propagate UB tail valid-regions and rewrite unary/binary/scalar ops to
     # tail-aware variants (must run before passes that reorder copy/vector ops).
     # The pass self-gates on TL_ASCEND_TAIL_MASK (default off) and is a no-op
-    # otherwise, so non-tail kernels are unaffected. Reduce is NOT rewritten for
-    # now (the tail_reduce ReduceSum<AR> path has an output-layout bug); it stays
-    # on the full-tile + pad_value path, revisited in batch 2 with
-    # compare/select/broadcast tail support.
-    mod = tilelang.transform.AscendTailMaskPropagation(rewrite_reduce=False)(mod)
+    # otherwise, so non-tail kernels are unaffected. Reduce rewrite is enabled
+    # only for the AscendC backend; the pass itself keeps a strict allow-list for
+    # reduce_sum over the last axis. PTO and all other reduce forms stay on the
+    # established full-tile + pad_value path.
+    rewrite_reduce = target.model == "ascendc" or target.model == "auto"
+    mod = tilelang.transform.AscendTailMaskPropagation(rewrite_reduce=rewrite_reduce)(mod)
     # Erase manual workspace allocations for virtual CV copy in Ascend
     mod = tilelang.transform.AscendWorkspaceReduction()(mod)
     # Legalize vectorized loops to ensure they are valid

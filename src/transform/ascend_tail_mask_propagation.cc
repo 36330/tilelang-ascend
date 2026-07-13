@@ -406,7 +406,21 @@ private:
     // The valid_row/valid_col must also not reference loop vars that have
     // already gone out of scope (e.g. a copy seeded inside `for by` whose
     // valid_col = f(by), but the reduce runs outside the loop).
-    bool ok = rewrite_reduce_ && CleanTail(PtrExtent(call->args[2]), in) &&
+    // Batch 1.1 deliberately enables only the smallest validated reduce
+    // contract: reduce_sum over the last axis with clear=true and a contiguous
+    // output vector.  Other kinds, axes and accumulation semantics keep using
+    // the established full-tile + pad path until they have dedicated tests.
+    DataType src_dtype = PtrDtype(call->args[2]);
+    PrimExpr out_extent = PtrExtent(call->args[1]);
+    bool supported_contract =
+        call->args.size() == 5 && kind == "reduce_sum" &&
+        (raw_dim == 1 || raw_dim == -1) && is_one(call->args[4]) &&
+        src_dtype == DataType::Float(32) &&
+        PtrDtype(call->args[1]) == src_dtype && out_extent.defined() &&
+        in.physical_row.defined() &&
+        analyzer_->CanProveEqual(out_extent, in.physical_row);
+    bool ok = rewrite_reduce_ && supported_contract &&
+              CleanTail(PtrExtent(call->args[2]), in) &&
               SupportedTailDtype(PtrDtype(call->args[2])) &&
               !HasOutOfScopeLoopVar(in.valid_row) &&
               !HasOutOfScopeLoopVar(in.valid_col) && !IsBroadcastScalarMask(in);
@@ -494,7 +508,7 @@ private:
     size_t lt = tag.find('<');
     size_t gt = tag.rfind('>');
     if (lt == std::string::npos || gt == std::string::npos || gt <= lt)
-      return -1;
+      return 2;
     std::string inner = tag.substr(lt + 1, gt - lt - 1);
     size_t comma = inner.rfind(',');
     std::string dim_str =
@@ -502,7 +516,7 @@ private:
     try {
       return std::stoi(dim_str);
     } catch (...) {
-      return -1;
+      return 2;
     }
   }
 };

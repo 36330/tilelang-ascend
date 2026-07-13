@@ -345,6 +345,51 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 
 
 # =============================================================================
+# Group 2d - AscendC last-axis tail reduce_sum   [risk: high]
+# Version 1 intentionally covers only sum, dim=-1 and clear=true. Each N tile
+# produces one partial row sum, so the output shape is [M, ceildiv(N, block_N)].
+# =============================================================================
+def reduce_sum_last_axis_tail(M, N, block_M, block_N, dtype="float"):
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+
+    @T.prim_func
+    def main(
+        Input: T.Tensor((M, N), dtype),  # type: ignore
+        Output: T.Tensor((M, n_num), dtype),  # type: ignore
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+            in_ub = T.alloc_ub((block_M, block_N), dtype)
+            out_ub = T.alloc_ub((block_M, 1), dtype)
+
+            T.copy(Input[bx * block_M, by * block_N], in_ub)
+            T.reduce_sum(in_ub, out_ub, dim=-1, clear=True)
+            T.copy(out_ub, Output[bx * block_M, by])
+
+    return main
+
+
+def test_reduce_sum_last_axis_tail_ascendc():
+    M, N, block_M, block_N = 34, 130, 32, 32
+    func = reduce_sum_last_axis_tail(M, N, block_M, block_N)
+    func = tilelang.compile(
+        func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc"
+    )
+
+    torch.manual_seed(0)
+    a = torch.randn(M, N, dtype=torch.float32).npu()
+    out = func(a)
+
+    n_num = (N + block_N - 1) // block_N
+    ref = torch.empty((M, n_num), dtype=torch.float32, device=a.device)
+    for by in range(n_num):
+        ref[:, by] = a[:, by * block_N : min((by + 1) * block_N, N)].sum(dim=-1)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+# =============================================================================
 # Group 3 - CV fusion (matmul + add) tail   [risk: medium]
 # Mirrors examples/simple_fusion/matmul_add.py, but the grid uses T.ceildiv with
 # non-divisible M/N. C-scope (cube) tails ride gm2l1/l0c2gm; V-scope (vector,

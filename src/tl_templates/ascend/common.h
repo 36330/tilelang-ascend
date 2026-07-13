@@ -892,6 +892,7 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
   if (validRow == 0 || validCol == 0)
     return;
   if (dim == 0) {
@@ -907,8 +908,10 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
     return;
   }
   // dim == -1: reduce each row over its valid columns -> out[0..validRow).
-  // Use the proven Pattern-AR reduce: one contiguous block reduce when
-  // validCol == physCol, otherwise per-row (each row is contiguous internally).
+  // Keep a single explicit layout contract for the first enabled tail-reduce
+  // path: every row writes one scalar to contiguous out[r].  The native
+  // Pattern-AR path is intentionally not used here because its runtime-shape
+  // output layout has not yet been validated for tail blocks.
   // clear == false is handled by backing up the old result and merging.
   constexpr uint32_t kTailMaxRows = 256;
   T backup[kTailMaxRows];
@@ -917,21 +920,11 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
     for (uint32_t r = 0; r < validRow; ++r)
       backup[r] = out.GetValue(r);
   }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): AR-pattern ReduceSum with a sub-tile
-    // shape {1, validCol} triggers aicore exceptions on some tiles, so fall
-    // back to explicit scalar accumulation (always correct; tail validCol is
-    // small so the cost is bounded). merge (clear==false) handled below.
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = static_cast<T>(0);
-      for (uint32_t c = 0; c < validCol; ++c)
-        acc = static_cast<T>(acc + src.GetValue(r * physCol + c));
-      out.SetValue(r, acc);
-    }
+  for (uint32_t r = 0; r < validRow; ++r) {
+    T acc = static_cast<T>(0);
+    for (uint32_t c = 0; c < validCol; ++c)
+      acc = static_cast<T>(acc + src.GetValue(r * physCol + c));
+    out.SetValue(r, acc);
   }
   if (merge) {
     for (uint32_t r = 0; r < validRow; ++r)
