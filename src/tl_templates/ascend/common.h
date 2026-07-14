@@ -912,23 +912,13 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
   // path: every row writes one scalar to contiguous out[r].  The native
   // Pattern-AR path is intentionally not used here because its runtime-shape
   // output layout has not yet been validated for tail blocks.
-  // clear == false is handled by backing up the old result and merging.
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
   for (uint32_t r = 0; r < validRow; ++r) {
     T acc = static_cast<T>(0);
     for (uint32_t c = 0; c < validCol; ++c)
       acc = static_cast<T>(acc + src.GetValue(r * physCol + c));
+    if (!clear)
+      acc = static_cast<T>(out.GetValue(r) + acc);
     out.SetValue(r, acc);
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, static_cast<T>(out.GetValue(r) + backup[r]));
   }
 }
 
@@ -951,33 +941,18 @@ CATLASS_DEVICE void tail_reduce_max(LocalTensor<T> out, LocalTensor<T> src,
     }
     return;
   }
-  // dim == -1: reduce each row over its valid columns (Pattern-AR).
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): scalar fallback (see
-    // tail_reduce_sum).
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = src.GetValue(r * physCol);
-      for (uint32_t c = 1; c < validCol; ++c) {
-        T v = src.GetValue(r * physCol + c);
-        acc = reduce_scalar_max_safe(acc, v);
-      }
-      out.SetValue(r, acc);
+  // dim == -1: reduce each row over its valid columns with an explicit
+  // contiguous out[r] layout.
+  (void)tmp;
+  for (uint32_t r = 0; r < validRow; ++r) {
+    T acc = src.GetValue(r * physCol);
+    for (uint32_t c = 1; c < validCol; ++c) {
+      T v = src.GetValue(r * physCol + c);
+      acc = reduce_scalar_max_safe(acc, v);
     }
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, reduce_scalar_max_safe(out.GetValue(r), backup[r]));
+    if (!clear)
+      acc = reduce_scalar_max_safe(out.GetValue(r), acc);
+    out.SetValue(r, acc);
   }
 }
 
@@ -1000,33 +975,18 @@ CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
     }
     return;
   }
-  // dim == -1: reduce each row over its valid columns (Pattern-AR).
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceMin<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): scalar fallback (see
-    // tail_reduce_sum).
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = src.GetValue(r * physCol);
-      for (uint32_t c = 1; c < validCol; ++c) {
-        T v = src.GetValue(r * physCol + c);
-        acc = reduce_scalar_min_safe(acc, v);
-      }
-      out.SetValue(r, acc);
+  // dim == -1: reduce each row over its valid columns with an explicit
+  // contiguous out[r] layout.
+  (void)tmp;
+  for (uint32_t r = 0; r < validRow; ++r) {
+    T acc = src.GetValue(r * physCol);
+    for (uint32_t c = 1; c < validCol; ++c) {
+      T v = src.GetValue(r * physCol + c);
+      acc = reduce_scalar_min_safe(acc, v);
     }
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, reduce_scalar_min_safe(out.GetValue(r), backup[r]));
+    if (!clear)
+      acc = reduce_scalar_min_safe(out.GetValue(r), acc);
+    out.SetValue(r, acc);
   }
 }
 

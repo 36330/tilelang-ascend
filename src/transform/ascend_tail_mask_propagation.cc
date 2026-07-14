@@ -18,10 +18,10 @@
  * valid_row/valid_col/physical_col) so the codegen emits a tl::ascend::tail_*
  * helper that computes only over the valid region.
  *
- * Batch 1 rewrites: unary / binary / scalar(immediate) / reduce.
- * Batch 1 propagates-but-does-not-rewrite: cast / broadcast / copy_ub_to_ub
- * (they are per-lane or shape-only, so the full-tile path stays numerically
- * correct; the mask still flows through to a downstream reduce).
+ * Rewrites: unary / binary / scalar(immediate), plus a conservative allow-list
+ * of 2D reduce contracts. Propagates-but-does-not-rewrite: cast / broadcast /
+ * copy_ub_to_ub (they are per-lane or shape-only, so the full-tile path stays
+ * numerically correct; the mask still flows through to a downstream reduce).
  */
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -406,19 +406,26 @@ private:
     // The valid_row/valid_col must also not reference loop vars that have
     // already gone out of scope (e.g. a copy seeded inside `for by` whose
     // valid_col = f(by), but the reduce runs outside the loop).
-    // Batch 1.1 deliberately enables only the smallest validated reduce
-    // contract: reduce_sum over the last axis with clear=true and a contiguous
-    // output vector.  Other kinds, axes and accumulation semantics keep using
-    // the established full-tile + pad path until they have dedicated tests.
+    // Enable the contracts whose output layout is explicit and validated:
+    // float32 sum/max/min, clear=true, reducing either axis of a 2D tile.
+    // Accumulating reductions and lower-precision accumulation keep using the
+    // established full-tile + pad path until their backend semantics are
+    // validated independently.
     DataType src_dtype = PtrDtype(call->args[2]);
     PrimExpr out_extent = PtrExtent(call->args[1]);
+    bool supported_kind =
+        kind == "reduce_sum" || kind == "reduce_max" || kind == "reduce_min";
+    bool supported_dim =
+        raw_dim == 0 || raw_dim == -2 || raw_dim == 1 || raw_dim == -1;
+    PrimExpr expected_out_extent =
+        (raw_dim == 0 || raw_dim == -2) ? in.physical_col : in.physical_row;
     bool supported_contract =
-        call->args.size() == 5 && kind == "reduce_sum" &&
-        (raw_dim == 1 || raw_dim == -1) && is_one(call->args[4]) &&
-        src_dtype == DataType::Float(32) &&
+        call->args.size() == 5 && supported_kind && supported_dim &&
+        is_one(call->args[4]) && src_dtype == DataType::Float(32) &&
         PtrDtype(call->args[1]) == src_dtype && out_extent.defined() &&
-        in.physical_row.defined() &&
-        analyzer_->CanProveEqual(out_extent, in.physical_row);
+        expected_out_extent.defined() &&
+        analyzer_->CanProveEqual(out_extent, expected_out_extent) &&
+        ReduceShapeMatchesPhysical(reduce_tag, in);
     bool ok = rewrite_reduce_ && supported_contract &&
               CleanTail(PtrExtent(call->args[2]), in) &&
               SupportedTailDtype(PtrDtype(call->args[2])) &&
@@ -428,19 +435,13 @@ private:
     // Output rectangle for downstream propagation (only when rewriting).
     TailMaskInfo out;
     if (ok) {
-      out.kind = TailMaskKind::kTail;
       if (dim == 0) {
-        out.valid_row = IntImm(DataType::Int(32), 1);
-        out.valid_col = in.valid_col;
-        out.physical_row = IntImm(DataType::Int(32), 1);
-        out.physical_col = in.physical_col;
+        PrimExpr one = IntImm(DataType::Int(32), 1);
+        out = MakeCopyMask(one, in.valid_col, one, in.physical_col, analyzer_);
       } else { // dim == -1 (reduce last axis) -> column vector
-        out.valid_row = in.valid_row;
-        out.valid_col = IntImm(DataType::Int(32), 1);
-        out.physical_row = in.physical_row;
-        out.physical_col = IntImm(DataType::Int(32), 1);
+        PrimExpr one = IntImm(DataType::Int(32), 1);
+        out = MakeCopyMask(in.valid_row, one, in.physical_row, one, analyzer_);
       }
-      out.storage_col = out.physical_col;
     }
     if (out_v != nullptr)
       state_[out_v] = out;
@@ -517,6 +518,46 @@ private:
       return std::stoi(dim_str);
     } catch (...) {
       return 2;
+    }
+  }
+
+  bool ReduceShapeMatchesPhysical(const std::string &tag,
+                                  const TailMaskInfo &in) {
+    if (!in.physical_row.defined() || !in.physical_col.defined())
+      return false;
+    size_t lt = tag.find('<');
+    size_t gt = tag.rfind('>');
+    if (lt == std::string::npos || gt == std::string::npos || gt <= lt)
+      return false;
+    std::string inner = tag.substr(lt + 1, gt - lt - 1);
+    size_t dtype_end = inner.find(',');
+    if (dtype_end == std::string::npos)
+      return false;
+    size_t row_end = inner.find(',', dtype_end + 1);
+    if (row_end == std::string::npos)
+      return false;
+    size_t col_end = inner.find(',', row_end + 1);
+    if (col_end == std::string::npos)
+      return false;
+    try {
+      auto parse_int = [](const std::string &token, int *value) {
+        size_t parsed = 0;
+        *value = std::stoi(token, &parsed);
+        return token.find_first_not_of(" \t", parsed) == std::string::npos;
+      };
+      int row = 0;
+      int col = 0;
+      if (!parse_int(inner.substr(dtype_end + 1, row_end - dtype_end - 1),
+                     &row) ||
+          !parse_int(inner.substr(row_end + 1, col_end - row_end - 1), &col))
+        return false;
+      return row > 0 && col > 0 &&
+             analyzer_->CanProveEqual(in.physical_row, row) &&
+             analyzer_->CanProveEqual(in.physical_col, col);
+    } catch (...) {
+      // Dynamic or otherwise unparseable explicit real_shape stays on the
+      // established native reduce path.
+      return false;
     }
   }
 };

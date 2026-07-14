@@ -345,13 +345,18 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 
 
 # =============================================================================
-# Group 2d - AscendC last-axis tail reduce_sum   [risk: high]
-# Version 1 intentionally covers only sum, dim=-1 and clear=true. Each N tile
-# produces one partial row sum, so the output shape is [M, ceildiv(N, block_N)].
+# Group 2d - AscendC 2D tail reductions   [risk: high]
+# Covers sum/max/min with clear=true on both axes. Each tile writes one partial
+# reduction, so different blocks never race on the output.
 # =============================================================================
-def reduce_sum_last_axis_tail(M, N, block_M, block_N, dtype="float"):
+def reduce_last_axis_tail(M, N, block_M, block_N, kind, dtype="float"):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
+    reduce_fn = {
+        "sum": T.reduce_sum,
+        "max": T.reduce_max,
+        "min": T.reduce_min,
+    }[kind]
 
     @T.prim_func
     def main(
@@ -365,15 +370,16 @@ def reduce_sum_last_axis_tail(M, N, block_M, block_N, dtype="float"):
             out_ub = T.alloc_ub((block_M, 1), dtype)
 
             T.copy(Input[bx * block_M, by * block_N], in_ub)
-            T.reduce_sum(in_ub, out_ub, dim=-1, clear=True)
+            reduce_fn(in_ub, out_ub, dim=-1, clear=True)
             T.copy(out_ub, Output[bx * block_M, by])
 
     return main
 
 
-def test_reduce_sum_last_axis_tail_ascendc():
+@pytest.mark.parametrize("kind", ["sum", "max", "min"])
+def test_reduce_last_axis_tail_ascendc(kind):
     M, N, block_M, block_N = 34, 130, 32, 32
-    func = reduce_sum_last_axis_tail(M, N, block_M, block_N)
+    func = reduce_last_axis_tail(M, N, block_M, block_N, kind)
     func = tilelang.compile(
         func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc"
     )
@@ -385,7 +391,57 @@ def test_reduce_sum_last_axis_tail_ascendc():
     n_num = (N + block_N - 1) // block_N
     ref = torch.empty((M, n_num), dtype=torch.float32, device=a.device)
     for by in range(n_num):
-        ref[:, by] = a[:, by * block_N : min((by + 1) * block_N, N)].sum(dim=-1)
+        tile = a[:, by * block_N : min((by + 1) * block_N, N)]
+        reduced = getattr(tile, kind)(dim=-1)
+        ref[:, by] = reduced if kind == "sum" else reduced.values
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+def reduce_axis0_tail(M, N, block_M, block_N, kind, dtype="float"):
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+    reduce_fn = {
+        "sum": T.reduce_sum,
+        "max": T.reduce_max,
+        "min": T.reduce_min,
+    }[kind]
+
+    @T.prim_func
+    def main(
+        Input: T.Tensor((M, N), dtype),  # type: ignore
+        Output: T.Tensor((m_num, N), dtype),  # type: ignore
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+            in_ub = T.alloc_ub((block_M, block_N), dtype)
+            out_ub = T.alloc_ub((1, block_N), dtype)
+
+            T.copy(Input[bx * block_M, by * block_N], in_ub)
+            reduce_fn(in_ub, out_ub, dim=0, clear=True)
+            T.copy(out_ub, Output[bx, by * block_N])
+
+    return main
+
+
+@pytest.mark.parametrize("kind", ["sum", "max", "min"])
+def test_reduce_axis0_tail_ascendc(kind):
+    M, N, block_M, block_N = 34, 130, 32, 32
+    func = reduce_axis0_tail(M, N, block_M, block_N, kind)
+    func = tilelang.compile(
+        func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc"
+    )
+
+    torch.manual_seed(0)
+    a = torch.randn(M, N, dtype=torch.float32).npu()
+    out = func(a)
+
+    m_num = (M + block_M - 1) // block_M
+    ref = torch.empty((m_num, N), dtype=torch.float32, device=a.device)
+    for bx in range(m_num):
+        tile = a[bx * block_M : min((bx + 1) * block_M, M), :]
+        reduced = getattr(tile, kind)(dim=0)
+        ref[bx, :] = reduced if kind == "sum" else reduced.values
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
 
