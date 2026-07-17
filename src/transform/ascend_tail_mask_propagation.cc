@@ -151,6 +151,8 @@ private:
   std::unordered_set<const VarNode *> active_loop_vars_;
 
   bool HasOutOfScopeLoopVar(const PrimExpr &e) const {
+    if (!e.defined())
+      return false;
     bool found = false;
     PostOrderVisit(e, [&](const ObjectRef &n) {
       if (const auto *v = n.as<VarNode>()) {
@@ -505,17 +507,30 @@ private:
   }
 
   static int ParseReduceDim(const std::string &tag) {
-    // tag like "reduce_sum<float, 16, 32, -1>"; dim is the last template field.
+    // tag like "reduce_sum<float, 16, 32, -1>"; dim is the fourth template
+    // field. Parse it from the known row/column fields instead of assuming it
+    // remains the final field if the tag gains more metadata later.
     size_t lt = tag.find('<');
     size_t gt = tag.rfind('>');
     if (lt == std::string::npos || gt == std::string::npos || gt <= lt)
       return 2;
     std::string inner = tag.substr(lt + 1, gt - lt - 1);
-    size_t comma = inner.rfind(',');
-    std::string dim_str =
-        comma == std::string::npos ? inner : inner.substr(comma + 1);
+    size_t dtype_end = inner.find(',');
+    if (dtype_end == std::string::npos)
+      return 2;
+    size_t row_end = inner.find(',', dtype_end + 1);
+    if (row_end == std::string::npos)
+      return 2;
+    size_t col_end = inner.find(',', row_end + 1);
+    if (col_end == std::string::npos)
+      return 2;
+    size_t dim_end = inner.find(',', col_end + 1);
+    std::string dim_str = inner.substr(col_end + 1, dim_end - (col_end + 1));
     try {
-      return std::stoi(dim_str);
+      size_t parsed = 0;
+      int dim = std::stoi(dim_str, &parsed);
+      return dim_str.find_first_not_of(" \t", parsed) == std::string::npos ? dim
+                                                                           : 2;
     } catch (...) {
       return 2;
     }

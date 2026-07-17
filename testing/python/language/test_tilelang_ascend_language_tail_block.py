@@ -371,7 +371,13 @@ def reduce_last_axis_tail(M, N, block_M, block_N, kind, dtype="float"):
 
             T.copy(Input[bx * block_M, by * block_N], in_ub)
             reduce_fn(in_ub, out_ub, dim=-1, clear=True)
-            T.copy(out_ub, Output[bx * block_M, by])
+            T.copy(
+                out_ub,
+                Output[
+                    bx * block_M : (bx + 1) * block_M,
+                    by : by + 1,
+                ],
+            )
 
     return main
 

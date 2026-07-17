@@ -911,7 +911,9 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
   // Keep a single explicit layout contract for the first enabled tail-reduce
   // path: every row writes one scalar to contiguous out[r].  The native
   // Pattern-AR path is intentionally not used here because its runtime-shape
-  // output layout has not yet been validated for tail blocks.
+  // output layout has not yet been validated for tail blocks. This GetValue /
+  // SetValue fallback runs on the scalar unit and is intentionally correctness
+  // first; replace it with a vector reduction once that layout is validated.
   for (uint32_t r = 0; r < validRow; ++r) {
     T acc = static_cast<T>(0);
     for (uint32_t c = 0; c < validCol; ++c)
@@ -941,8 +943,8 @@ CATLASS_DEVICE void tail_reduce_max(LocalTensor<T> out, LocalTensor<T> src,
     }
     return;
   }
-  // dim == -1: reduce each row over its valid columns with an explicit
-  // contiguous out[r] layout.
+  // dim == -1: correctness-first scalar fallback with an explicit contiguous
+  // out[r] layout. It is slower than a vector reduction; see tail_reduce_sum.
   (void)tmp;
   for (uint32_t r = 0; r < validRow; ++r) {
     T acc = src.GetValue(r * physCol);
@@ -975,8 +977,8 @@ CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
     }
     return;
   }
-  // dim == -1: reduce each row over its valid columns with an explicit
-  // contiguous out[r] layout.
+  // dim == -1: correctness-first scalar fallback with an explicit contiguous
+  // out[r] layout. It is slower than a vector reduction; see tail_reduce_sum.
   (void)tmp;
   for (uint32_t r = 0; r < validRow; ++r) {
     T acc = src.GetValue(r * physCol);
