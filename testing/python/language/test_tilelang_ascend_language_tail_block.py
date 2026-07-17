@@ -380,9 +380,7 @@ def reduce_last_axis_tail(M, N, block_M, block_N, kind, dtype="float"):
 def test_reduce_last_axis_tail_ascendc(kind):
     M, N, block_M, block_N = 34, 130, 32, 32
     func = reduce_last_axis_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(
-        func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc"
-    )
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc")
 
     torch.manual_seed(0)
     a = torch.randn(M, N, dtype=torch.float32).npu()
@@ -428,9 +426,7 @@ def reduce_axis0_tail(M, N, block_M, block_N, kind, dtype="float"):
 def test_reduce_axis0_tail_ascendc(kind):
     M, N, block_M, block_N = 34, 130, 32, 32
     func = reduce_axis0_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(
-        func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc"
-    )
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc")
 
     torch.manual_seed(0)
     a = torch.randn(M, N, dtype=torch.float32).npu()

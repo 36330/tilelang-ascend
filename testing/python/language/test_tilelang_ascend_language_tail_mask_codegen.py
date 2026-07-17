@@ -56,9 +56,7 @@ def _tail_add(M, N, block_M, block_N, dtype="float"):
     return main
 
 
-def _tail_reduce(
-    M, N, block_M, block_N, dtype="float", kind="sum", clear=True
-):
+def _tail_reduce(M, N, block_M, block_N, dtype="float", kind="sum", clear=True):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
     reduce_fn = {
@@ -255,11 +253,7 @@ def test_tail_scalar_emits_tail_helper(target):
 @pytest.mark.parametrize("kind", ["sum", "max", "min"])
 @pytest.mark.parametrize("axis", [-1, 0])
 def test_tail_reduce_float32_emits_ascendc_helper(kind, axis):
-    func = (
-        _tail_reduce(34, 130, 32, 32, "float", kind=kind)
-        if axis == -1
-        else _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind)
-    )
+    func = _tail_reduce(34, 130, 32, 32, "float", kind=kind) if axis == -1 else _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind)
     src = _source(func, target="ascendc")
     assert f"tl::ascend::tail_reduce_{kind}" in src, src
 
@@ -305,9 +299,7 @@ def test_unsupported_tail_reduce_contracts_fall_back(func):
 
 
 def test_tail_reduce_flag_off_emits_no_tail_helper():
-    src = _source(
-        _tail_reduce(34, 130, 32, 32, "float"), target="ascendc", tail_mask=False
-    )
+    src = _source(_tail_reduce(34, 130, 32, 32, "float"), target="ascendc", tail_mask=False)
     assert "tl::ascend::tail_reduce" not in src, src
 
 
