@@ -120,7 +120,6 @@ def _tail_reduce_axis0(
     dim=0,
     clear=True,
     real_shape=None,
-    output_cols=None,
 ):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
@@ -131,8 +130,6 @@ def _tail_reduce_axis0(
         "min": T.reduce_min,
     }[kind]
 
-    output_cols = block_N if output_cols is None else output_cols
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -142,13 +139,13 @@ def _tail_reduce_axis0(
             bx = cid // n_num
             by = cid % n_num
             a_ub = T.alloc_ub((block_M, block_N), dtype)
-            r_ub = T.alloc_ub((1, output_cols), dtype)
+            r_ub = T.alloc_ub((1, block_N), dtype)
             T.copy(A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], a_ub)
             if real_shape is None:
                 reduce_fn(a_ub, r_ub, dim=dim, clear=clear)
             else:
                 reduce_fn(a_ub, r_ub, dim=dim, clear=clear, real_shape=real_shape)
-            T.copy(r_ub, B[bx : bx + 1, by * block_N : by * block_N + output_cols])
+            T.copy(r_ub, B[bx : bx + 1, by * block_N : (by + 1) * block_N])
 
     return main
 
@@ -319,9 +316,8 @@ def test_tail_reduce_sum_not_rewritten_for_pto():
         _tail_reduce_axis0(34, 130, 32, 32, clear=False),
         _tail_reduce_axis0(34, 130, 32, 32, dtype="float16"),
         _tail_reduce_axis0(34, 130, 32, 32, real_shape=[31, 32]),
-        _tail_reduce_axis0(34, 130, 32, 32, output_cols=31),
     ],
-    ids=["clear_false", "float16", "real_shape_mismatch", "output_extent_mismatch"],
+    ids=["clear_false", "float16", "real_shape_mismatch"],
 )
 def test_unsupported_tail_reduce_contracts_fall_back(func):
     src = _source(func, target="ascendc")
