@@ -15,6 +15,8 @@ import pytest
 
 import tilelang
 import tilelang.language as T
+from tilelang import tvm
+from tilelang.transform.pass_config import process_default_pass_config
 
 pass_configs = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
@@ -23,12 +25,6 @@ pass_configs = {
     # are actually emitted for these tests.
     tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: True,
 }
-
-
-@pytest.fixture(scope="session", autouse=True)
-def clear_cache():
-    tilelang.cache.clear_cache()
-    yield
 
 
 def _tail_add(M, N, block_M, block_N, dtype="float"):
@@ -213,9 +209,23 @@ def _tail_scalar(M, N, block_M, block_N, dtype="float"):
 
 
 def _source(func, target="ascendc", tail_mask=True):
-    cfg = {**pass_configs, tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: tail_mask}
-    compiled = tilelang.compile(func, pass_configs=cfg, target=target)
-    return compiled.get_kernel_source()
+    """Lower a PrimFunc and return generated device source.
+
+    These source-inspection tests intentionally avoid creating a JIT adapter
+    or compiling the generated AscendC/PTO source into a runnable kernel.
+    """
+    cfg = process_default_pass_config(
+        target,
+        {
+            **pass_configs,
+            tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: tail_mask,
+        },
+    )
+
+    with tvm.transform.PassContext(opt_level=3, config=cfg):
+        artifact = tilelang.lower(func, target=target, platform="auto")
+
+    return artifact.kernel_source
 
 
 # Per-backend "a tail-aware op was emitted" marker. The two backends express the
