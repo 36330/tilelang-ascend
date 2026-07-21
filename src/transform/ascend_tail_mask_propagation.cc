@@ -409,7 +409,9 @@ private:
     // already gone out of scope (e.g. a copy seeded inside `for by` whose
     // valid_col = f(by), but the reduce runs outside the loop).
     // Enable the contracts whose output layout is explicit and validated:
-    // float32 sum/max/min, clear=true, reducing either axis of a 2D tile.
+    // float32 sum/max/min, clear=true, reducing rows (axis 0/-2) of a 2D tile.
+    // The scalar last-axis fallback is not device-reliable for a full 32-row
+    // tile, so keep that contract on the established native path.
     // Accumulating reductions and lower-precision accumulation keep using the
     // established full-tile + pad path until their backend semantics are
     // validated independently.
@@ -417,8 +419,7 @@ private:
     PrimExpr out_extent = PtrExtent(call->args[1]);
     bool supported_kind =
         kind == "reduce_sum" || kind == "reduce_max" || kind == "reduce_min";
-    bool supported_dim =
-        raw_dim == 0 || raw_dim == -2 || raw_dim == 1 || raw_dim == -1;
+    bool supported_dim = raw_dim == 0 || raw_dim == -2;
     PrimExpr expected_out_extent =
         (raw_dim == 0 || raw_dim == -2) ? in.physical_col : in.physical_row;
     bool supported_contract =

@@ -251,22 +251,27 @@ def test_tail_scalar_emits_tail_helper(target):
 
 
 @pytest.mark.parametrize("kind", ["sum", "max", "min"])
-@pytest.mark.parametrize("axis", [-1, 0])
-def test_tail_reduce_float32_emits_ascendc_helper(kind, axis):
-    func = _tail_reduce(34, 130, 32, 32, "float", kind=kind) if axis == -1 else _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind)
+def test_tail_reduce_float32_axis0_emits_ascendc_helper(kind):
+    func = _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind)
     src = _source(func, target="ascendc")
     assert f"tl::ascend::tail_reduce_{kind}" in src, src
 
 
-def test_tail_reduce_propagates_non_reduced_axis_tail():
+@pytest.mark.parametrize("kind", ["sum", "max", "min"])
+def test_tail_reduce_float32_last_axis_uses_native_path(kind):
+    src = _source(_tail_reduce(34, 130, 32, 32, "float", kind=kind), target="ascendc")
+    assert "tl::ascend::tail_reduce" not in src, src
+
+
+def test_native_last_axis_reduce_clears_downstream_tail_state():
     src = _source(_tail_reduce_then_unary(34, 130, 32, 32), target="ascendc")
-    assert "tl::ascend::tail_reduce_sum" in src, src
-    assert "tl::ascend::tail_unary" in src, src
+    assert "tl::ascend::tail_reduce" not in src, src
+    assert "tl::ascend::tail_unary" not in src, src
 
 
-def test_tail_reduce_eliminates_reduced_axis_only_tail():
+def test_native_last_axis_reduce_with_column_tail_stays_native():
     src = _source(_tail_reduce_then_unary(32, 130, 32, 32), target="ascendc")
-    assert "tl::ascend::tail_reduce_sum" in src, src
+    assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
 
 

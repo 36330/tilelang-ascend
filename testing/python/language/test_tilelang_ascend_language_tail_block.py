@@ -345,62 +345,10 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 
 
 # =============================================================================
-# Group 2d - AscendC 2D tail reductions   [risk: high]
-# Covers sum/max/min with clear=true on both axes. Each tile writes one partial
+# Group 2d - AscendC axis-0 tail reductions   [risk: high]
+# Covers sum/max/min with clear=true. Each tile writes one partial
 # reduction, so different blocks never race on the output.
 # =============================================================================
-def reduce_last_axis_tail(M, N, block_M, block_N, kind, dtype="float"):
-    m_num = T.ceildiv(M, block_M)
-    n_num = T.ceildiv(N, block_N)
-    reduce_fn = {
-        "sum": T.reduce_sum,
-        "max": T.reduce_max,
-        "min": T.reduce_min,
-    }[kind]
-
-    @T.prim_func
-    def main(
-        Input: T.Tensor((M, N), dtype),  # type: ignore
-        Output: T.Tensor((M, n_num), dtype),  # type: ignore
-    ):
-        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
-            bx = cid // n_num
-            by = cid % n_num
-            in_ub = T.alloc_ub((block_M, block_N), dtype)
-            out_ub = T.alloc_ub((block_M, 1), dtype)
-
-            T.copy(Input[bx * block_M, by * block_N], in_ub)
-            reduce_fn(in_ub, out_ub, dim=-1, clear=True)
-            T.copy(
-                out_ub,
-                Output[
-                    bx * block_M : (bx + 1) * block_M,
-                    by : by + 1,
-                ],
-            )
-
-    return main
-
-
-@pytest.mark.parametrize("kind", ["sum", "max", "min"])
-def test_reduce_last_axis_tail_ascendc(kind):
-    M, N, block_M, block_N = 34, 130, 32, 32
-    func = reduce_last_axis_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc")
-
-    torch.manual_seed(0)
-    a = torch.randn(M, N, dtype=torch.float32).npu()
-    out = func(a)
-
-    n_num = (N + block_N - 1) // block_N
-    ref = torch.empty((M, n_num), dtype=torch.float32, device=a.device)
-    for by in range(n_num):
-        tile = a[:, by * block_N : min((by + 1) * block_N, N)]
-        reduced = getattr(tile, kind)(dim=-1)
-        ref[:, by] = reduced if kind == "sum" else reduced.values
-    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
-
-
 def reduce_axis0_tail(M, N, block_M, block_N, kind, dtype="float"):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
