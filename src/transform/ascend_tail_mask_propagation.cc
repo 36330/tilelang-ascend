@@ -395,10 +395,6 @@ private:
     std::string reduce_tag = name->value; // e.g. reduce_sum<...>
     std::string kind = reduce_tag.substr(0, reduce_tag.find('<')); // reduce_sum
     int raw_dim = ParseReduceDim(reduce_tag);
-    // Normalize to 0 (reduce rows) or -1 (reduce last axis). For 2D tiles
-    // axis 0/-2 reduce rows and axis 1/-1 reduce columns.
-    int dim = (raw_dim == 0 || raw_dim == -2) ? 0 : -1;
-
     const VarNode *out_v = GetPtrVar(call->args[1]);
     TailMaskInfo in = GetMask(GetPtrVar(call->args[2]));
 
@@ -420,8 +416,7 @@ private:
     bool supported_kind =
         kind == "reduce_sum" || kind == "reduce_max" || kind == "reduce_min";
     bool supported_dim = raw_dim == 0 || raw_dim == -2;
-    PrimExpr expected_out_extent =
-        (raw_dim == 0 || raw_dim == -2) ? in.physical_col : in.physical_row;
+    PrimExpr expected_out_extent = in.physical_col;
     bool supported_contract =
         call->args.size() == 5 && supported_kind && supported_dim &&
         is_one(call->args[4]) && src_dtype == DataType::Float(32) &&
@@ -438,13 +433,8 @@ private:
     // Output rectangle for downstream propagation (only when rewriting).
     TailMaskInfo out;
     if (ok) {
-      if (dim == 0) {
-        PrimExpr one = IntImm(DataType::Int(32), 1);
-        out = MakeCopyMask(one, in.valid_col, one, in.physical_col, analyzer_);
-      } else { // dim == -1 (reduce last axis) -> column vector
-        PrimExpr one = IntImm(DataType::Int(32), 1);
-        out = MakeCopyMask(in.valid_row, one, in.physical_row, one, analyzer_);
-      }
+      PrimExpr one = IntImm(DataType::Int(32), 1);
+      out = MakeCopyMask(one, in.valid_col, one, in.physical_col, analyzer_);
     }
     if (out_v != nullptr)
       state_[out_v] = out;
@@ -458,7 +448,7 @@ private:
                          call->args[1],
                          call->args[2],
                          call->args[3],
-                         IntImm(DataType::Int(32), dim),
+                         IntImm(DataType::Int(32), 0),
                          in.valid_row,
                          in.valid_col,
                          in.physical_col,

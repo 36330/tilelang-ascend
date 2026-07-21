@@ -6,8 +6,9 @@ with the Ascend codegen. They verify that:
 
   * a kernel with a real tail (M and/or N not divisible by the block) emits the
     internal ``tl::ascend::tail_*`` helpers, and
-  * the removed ``pad_value`` path (the UB gap-fill ``Duplicate``) is gone, i.e.
-    ``T.copy`` no longer carries a pad argument.
+  * guarded reduction contracts either emit the axis-0 tail helper or retain
+    the native reduce path. The hybrid ``pad_value`` fallback remains available
+    for unsupported full-tile readers.
 """
 
 import pytest
@@ -16,10 +17,8 @@ import tilelang
 import tilelang.language as T
 
 pass_configs = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     # Enable the opt-in tail-block scheme (default off) so the tail_* helpers
     # are actually emitted for these tests.
     tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: True,
@@ -82,33 +81,6 @@ def _tail_reduce(M, N, block_M, block_N, dtype="float", kind="sum", clear=True):
     return main
 
 
-def _tail_reduce_real_shape(M, N, block_M, block_N, dtype="float"):
-    m_num = T.ceildiv(M, block_M)
-    n_num = T.ceildiv(N, block_N)
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((M, N), dtype),
-        B: T.Tensor((m_num * n_num, block_M), dtype),
-    ):
-        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
-            bx = cid // n_num
-            by = cid % n_num
-            a_ub = T.alloc_ub((block_M, block_N), dtype)
-            r_ub = T.alloc_ub((block_M,), dtype)
-            T.copy(
-                A[
-                    bx * block_M : (bx + 1) * block_M,
-                    by * block_N : (by + 1) * block_N,
-                ],
-                a_ub,
-            )
-            T.reduce_sum(a_ub, r_ub, dim=-1, real_shape=[block_M, block_N - 1])
-            T.copy(r_ub, B[cid, :])
-
-    return main
-
-
 def _tail_reduce_then_unary(M, N, block_M, block_N, dtype="float"):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
@@ -138,7 +110,18 @@ def _tail_reduce_then_unary(M, N, block_M, block_N, dtype="float"):
     return main
 
 
-def _tail_reduce_axis0(M, N, block_M, block_N, dtype="float", kind="sum"):
+def _tail_reduce_axis0(
+    M,
+    N,
+    block_M,
+    block_N,
+    dtype="float",
+    kind="sum",
+    dim=0,
+    clear=True,
+    real_shape=None,
+    output_cols=None,
+):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
 
@@ -147,6 +130,8 @@ def _tail_reduce_axis0(M, N, block_M, block_N, dtype="float", kind="sum"):
         "max": T.reduce_max,
         "min": T.reduce_min,
     }[kind]
+
+    output_cols = block_N if output_cols is None else output_cols
 
     @T.prim_func
     def main(
@@ -157,10 +142,33 @@ def _tail_reduce_axis0(M, N, block_M, block_N, dtype="float", kind="sum"):
             bx = cid // n_num
             by = cid % n_num
             a_ub = T.alloc_ub((block_M, block_N), dtype)
-            r_ub = T.alloc_ub((1, block_N), dtype)
+            r_ub = T.alloc_ub((1, output_cols), dtype)
             T.copy(A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], a_ub)
-            reduce_fn(a_ub, r_ub, dim=0)
-            T.copy(r_ub, B[bx : bx + 1, by * block_N : (by + 1) * block_N])
+            if real_shape is None:
+                reduce_fn(a_ub, r_ub, dim=dim, clear=clear)
+            else:
+                reduce_fn(a_ub, r_ub, dim=dim, clear=clear, real_shape=real_shape)
+            T.copy(r_ub, B[bx : bx + 1, by * block_N : by * block_N + output_cols])
+
+    return main
+
+
+def _tail_reduce_axis0_then_unary(M, N, block_M, block_N, dtype="float"):
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+
+    @T.prim_func
+    def main(A: T.Tensor((M, N), dtype), B: T.Tensor((m_num, N), dtype)):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+            a_ub = T.alloc_ub((block_M, block_N), dtype)
+            r_ub = T.alloc_ub((1, block_N), dtype)
+            o_ub = T.alloc_ub((1, block_N), dtype)
+            T.copy(A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], a_ub)
+            T.reduce_sum(a_ub, r_ub, dim=0, clear=True)
+            T.tile.exp(o_ub, r_ub)
+            T.copy(o_ub, B[bx : bx + 1, by * block_N : (by + 1) * block_N])
 
     return main
 
@@ -231,6 +239,10 @@ def _no_tail_marker(target):
     return "tl::ascend::tail_" if target == "ascendc" else "pto::DYNAMIC"
 
 
+def _native_reduce_marker(kind):
+    return f"reduce_{kind}<"
+
+
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
 def test_tail_add_emits_tail_helper(target):
     # 34x130 with 32x32 blocks => tail in both M and N.
@@ -251,8 +263,9 @@ def test_tail_scalar_emits_tail_helper(target):
 
 
 @pytest.mark.parametrize("kind", ["sum", "max", "min"])
-def test_tail_reduce_float32_axis0_emits_ascendc_helper(kind):
-    func = _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind)
+@pytest.mark.parametrize("dim", [0, -2])
+def test_tail_reduce_float32_axis0_emits_ascendc_helper(kind, dim):
+    func = _tail_reduce_axis0(34, 130, 32, 32, "float", kind=kind, dim=dim)
     src = _source(func, target="ascendc")
     assert f"tl::ascend::tail_reduce_{kind}" in src, src
 
@@ -261,18 +274,27 @@ def test_tail_reduce_float32_axis0_emits_ascendc_helper(kind):
 def test_tail_reduce_float32_last_axis_uses_native_path(kind):
     src = _source(_tail_reduce(34, 130, 32, 32, "float", kind=kind), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
+    assert _native_reduce_marker(kind) in src, src
+
+
+def test_tail_reduce_axis0_propagates_column_tail_to_unary():
+    src = _source(_tail_reduce_axis0_then_unary(34, 130, 32, 32), target="ascendc")
+    assert "tl::ascend::tail_reduce_sum" in src, src
+    assert "tl::ascend::tail_unary" in src, src
 
 
 def test_native_last_axis_reduce_clears_downstream_tail_state():
     src = _source(_tail_reduce_then_unary(34, 130, 32, 32), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
+    assert _native_reduce_marker("sum") in src, src
 
 
 def test_native_last_axis_reduce_with_column_tail_stays_native():
     src = _source(_tail_reduce_then_unary(32, 130, 32, 32), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
+    assert _native_reduce_marker("sum") in src, src
 
 
 def test_unsupported_reduce_clears_downstream_tail_state():
@@ -282,30 +304,38 @@ def test_unsupported_reduce_clears_downstream_tail_state():
     )
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
+    assert _native_reduce_marker("sum") in src, src
 
 
 def test_tail_reduce_sum_not_rewritten_for_pto():
-    src = _source(_tail_reduce(34, 130, 32, 32, "float"), target="pto")
+    src = _source(_tail_reduce_axis0(34, 130, 32, 32), target="pto")
     assert _no_tail_marker("pto") not in src, src
+    assert _native_reduce_marker("sum") in src, src
 
 
 @pytest.mark.parametrize(
     "func",
     [
-        _tail_reduce(34, 130, 32, 32, "float", clear=False),
-        _tail_reduce(34, 130, 32, 32, "float16"),
-        _tail_reduce_real_shape(34, 130, 32, 32, "float"),
+        _tail_reduce_axis0(34, 130, 32, 32, clear=False),
+        _tail_reduce_axis0(34, 130, 32, 32, dtype="float16"),
+        _tail_reduce_axis0(34, 130, 32, 32, real_shape=[31, 32]),
+        _tail_reduce_axis0(34, 130, 32, 32, output_cols=31),
     ],
-    ids=["reduce_sum_clear_false", "float16", "explicit_real_shape"],
+    ids=["clear_false", "float16", "real_shape_mismatch", "output_extent_mismatch"],
 )
 def test_unsupported_tail_reduce_contracts_fall_back(func):
     src = _source(func, target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
+    assert _native_reduce_marker("sum") in src, src
 
 
 def test_tail_reduce_flag_off_emits_no_tail_helper():
-    src = _source(_tail_reduce(34, 130, 32, 32, "float"), target="ascendc", tail_mask=False)
-    assert "tl::ascend::tail_reduce" not in src, src
+    func = _tail_reduce_axis0(34, 130, 32, 32)
+    src_on = _source(func, target="ascendc", tail_mask=True)
+    src_off = _source(func, target="ascendc", tail_mask=False)
+    assert "tl::ascend::tail_reduce_sum" in src_on, src_on
+    assert "tl::ascend::tail_reduce" not in src_off, src_off
+    assert _native_reduce_marker("sum") in src_off, src_off
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])

@@ -60,13 +60,20 @@ CUBE_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
 }
 
-# VECTOR: mirrors the elementwise suite's config (CV combine is harmless for a
-# pure-vector kernel and matches the existing passing tests).
+# VECTOR: the elementwise suite keeps its established configuration.
 VEC_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+}
+
+# Tail reduction is a pure-vector kernel. Keep its configuration isolated from
+# CV combine/sync so this suite exercises only the passes required by reduce.
+TAIL_REDUCE_PASS_CONFIGS = {
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
+    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+    tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: True,
 }
 
 
@@ -334,8 +341,9 @@ reduce_tail_configs = [
 ]
 
 
-# tail_mask=True also asserts that enabling the switch does not disturb the
-# real_shape reduce (reduce is not rewritten while rewrite_reduce=False).
+# For AscendC, reduce rewriting is enabled, but this explicit real_shape does
+# not match the physical tile and therefore stays on the native real_shape
+# path. PTO disables reduce rewriting at the phase level.
 @pytest.mark.parametrize("tail_mask", [False, True])
 @pytest.mark.parametrize("dtype", ["float"])
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
@@ -349,7 +357,7 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 # Covers sum/max/min with clear=true. Each tile writes one partial
 # reduction, so different blocks never race on the output.
 # =============================================================================
-def reduce_axis0_tail(M, N, block_M, block_N, kind, dtype="float"):
+def reduce_axis0_tail(M, N, block_M, block_N, kind, dim=0, dtype="float"):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
     reduce_fn = {
@@ -370,17 +378,29 @@ def reduce_axis0_tail(M, N, block_M, block_N, kind, dtype="float"):
             out_ub = T.alloc_ub((1, block_N), dtype)
 
             T.copy(Input[bx * block_M, by * block_N], in_ub)
-            reduce_fn(in_ub, out_ub, dim=0, clear=True)
+            reduce_fn(in_ub, out_ub, dim=dim, clear=True)
             T.copy(out_ub, Output[bx, by * block_N])
 
     return main
 
 
+reduce_axis0_configs = [
+    (34, 128, 32, 32),  # row tail only
+    (32, 130, 32, 32),  # column tail only
+    (34, 130, 32, 32),  # row and column tails
+    (33, 129, 32, 32),  # one valid row and one valid column in the last tile
+    (7, 13, 32, 32),  # tensor smaller than one physical tile
+    (32, 128, 32, 32),  # exact full tiles
+    (65, 130, 64, 32),  # larger physical row with a one-row tail
+]
+
+
 @pytest.mark.parametrize("kind", ["sum", "max", "min"])
-def test_reduce_axis0_tail_ascendc(kind):
-    M, N, block_M, block_N = 34, 130, 32, 32
-    func = reduce_axis0_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(tail_mask=True), target="ascendc")
+@pytest.mark.parametrize("dim", [0, -2])
+@pytest.mark.parametrize("M,N,block_M,block_N", reduce_axis0_configs)
+def test_reduce_axis0_tail_ascendc(M, N, block_M, block_N, kind, dim):
+    func = reduce_axis0_tail(M, N, block_M, block_N, kind, dim=dim)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc")
 
     torch.manual_seed(0)
     a = torch.randn(M, N, dtype=torch.float32).npu()
@@ -393,6 +413,29 @@ def test_reduce_axis0_tail_ascendc(kind):
         reduced = getattr(tile, kind)(dim=0)
         ref[bx, :] = reduced if kind == "sum" else reduced.values
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("kind", ["sum", "max", "min"])
+def test_reduce_axis0_special_values_ascendc(kind):
+    M, N, block_M, block_N = 3, 8, 4, 8
+    func = reduce_axis0_tail(M, N, block_M, block_N, kind)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc")
+
+    a = torch.tensor(
+        [
+            [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1.0, -1.0, 3.0],
+            [-0.0, 0.0, 2.0, -2.0, 4.0, float("nan"), -3.0, 3.0],
+            [0.0, -0.0, -5.0, 5.0, -4.0, 2.0, float("nan"), -3.0],
+        ],
+        dtype=torch.float32,
+    ).npu()
+    out = func(a)[0]
+    reduced = getattr(a, kind)(dim=0)
+    ref = reduced if kind == "sum" else reduced.values
+    torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
+
+    finite_zero = (ref == 0) & ~torch.isnan(ref)
+    torch.testing.assert_close(torch.signbit(out[finite_zero]), torch.signbit(ref[finite_zero]))
 
 
 # =============================================================================

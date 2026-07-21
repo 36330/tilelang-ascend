@@ -885,42 +885,25 @@ CATLASS_DEVICE void tail_scalar(TailVecScalarOp op, LocalTensor<T> dst,
 }
 
 // ---- reduce ----
-// dim == -1 : reduce each row over its valid columns -> out[0..validRow).
-// dim == 0  : reduce down the valid rows           -> out[0..validCol).
+// The propagation pass emits this helper only for axis 0/-2: reduce down the
+// valid rows into out[0..validCol). `tmp`, `dim`, and `clear` stay in the ABI
+// shared with the native reduce call; this validated contract does not consume
+// tmp and always arrives normalized as dim == 0, clear == true.
 template <typename T>
 CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
   (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: reduce each row over its valid columns -> out[0..validRow).
-  // Keep a single explicit layout contract for the first enabled tail-reduce
-  // path: every row writes one scalar to contiguous out[r].  The native
-  // Pattern-AR path is intentionally not used here because its runtime-shape
-  // output layout has not yet been validated for tail blocks. This GetValue /
-  // SetValue fallback runs on the scalar unit and is intentionally correctness
-  // first; replace it with a vector reduction once that layout is validated.
-  for (uint32_t r = 0; r < validRow; ++r) {
-    T acc = static_cast<T>(0);
-    for (uint32_t c = 0; c < validCol; ++c)
-      acc = static_cast<T>(acc + src.GetValue(r * physCol + c));
-    if (!clear)
-      acc = static_cast<T>(out.GetValue(r) + acc);
-    out.SetValue(r, acc);
+  // Multiplication by one preserves signed zero while initializing the first
+  // row; Adds(..., 0) may canonicalize -0.0 on device.
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
@@ -929,32 +912,14 @@ CATLASS_DEVICE void tail_reduce_max(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: correctness-first scalar fallback with an explicit contiguous
-  // out[r] layout. It is slower than a vector reduction; see tail_reduce_sum.
-  (void)tmp;
-  for (uint32_t r = 0; r < validRow; ++r) {
-    T acc = src.GetValue(r * physCol);
-    for (uint32_t c = 1; c < validCol; ++c) {
-      T v = src.GetValue(r * physCol + c);
-      acc = reduce_scalar_max_safe(acc, v);
-    }
-    if (!clear)
-      acc = reduce_scalar_max_safe(out.GetValue(r), acc);
-    out.SetValue(r, acc);
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
@@ -963,32 +928,14 @@ CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: correctness-first scalar fallback with an explicit contiguous
-  // out[r] layout. It is slower than a vector reduction; see tail_reduce_sum.
-  (void)tmp;
-  for (uint32_t r = 0; r < validRow; ++r) {
-    T acc = src.GetValue(r * physCol);
-    for (uint32_t c = 1; c < validCol; ++c) {
-      T v = src.GetValue(r * physCol + c);
-      acc = reduce_scalar_min_safe(acc, v);
-    }
-    if (!clear)
-      acc = reduce_scalar_min_safe(out.GetValue(r), acc);
-    out.SetValue(r, acc);
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
