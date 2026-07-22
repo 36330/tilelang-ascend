@@ -246,8 +246,20 @@ def _no_tail_marker(target):
     return "tl::ascend::tail_" if target == "ascendc" else "pto::DYNAMIC"
 
 
-def _native_reduce_marker(kind):
-    return f"reduce_{kind}<"
+def _native_reduce_marker(kind, *, target="ascendc", dtype="float", clear=True):
+    """Return a backend-specific marker for a native reduce path."""
+    if target == "pto":
+        return {
+            "sum": "TADD(",
+            "max": "TMAX(",
+            "min": "TMIN(",
+        }[kind]
+
+    # AscendC uses a dedicated helper for clear=true float16 sum reductions.
+    if kind == "sum" and dtype == "float16" and clear:
+        return "tl::ascend::reduce_sum_half<"
+
+    return f"tl::ascend::reduce_{kind}<"
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
@@ -281,7 +293,7 @@ def test_tail_reduce_float32_axis0_emits_ascendc_helper(kind, dim):
 def test_tail_reduce_float32_last_axis_uses_native_path(kind):
     src = _source(_tail_reduce(34, 130, 32, 32, "float", kind=kind), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
-    assert _native_reduce_marker(kind) in src, src
+    assert _native_reduce_marker(kind, target="ascendc", dtype="float") in src, src
 
 
 def test_tail_reduce_axis0_propagates_column_tail_to_unary():
@@ -294,14 +306,14 @@ def test_native_last_axis_reduce_clears_downstream_tail_state():
     src = _source(_tail_reduce_then_unary(34, 130, 32, 32), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
-    assert _native_reduce_marker("sum") in src, src
+    assert _native_reduce_marker("sum", target="ascendc", dtype="float") in src, src
 
 
 def test_native_last_axis_reduce_with_column_tail_stays_native():
     src = _source(_tail_reduce_then_unary(32, 130, 32, 32), target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
-    assert _native_reduce_marker("sum") in src, src
+    assert _native_reduce_marker("sum", target="ascendc", dtype="float") in src, src
 
 
 def test_unsupported_reduce_clears_downstream_tail_state():
@@ -311,28 +323,37 @@ def test_unsupported_reduce_clears_downstream_tail_state():
     )
     assert "tl::ascend::tail_reduce" not in src, src
     assert "tl::ascend::tail_unary" not in src, src
-    assert _native_reduce_marker("sum") in src, src
+    assert _native_reduce_marker("sum", target="ascendc", dtype="float16") in src, src
 
 
 def test_tail_reduce_sum_not_rewritten_for_pto():
     src = _source(_tail_reduce_axis0(34, 130, 32, 32), target="pto")
     assert _no_tail_marker("pto") not in src, src
-    assert _native_reduce_marker("sum") in src, src
+    assert _native_reduce_marker("sum", target="pto") in src, src
 
 
 @pytest.mark.parametrize(
-    "func",
+    ("func", "native_marker"),
     [
-        _tail_reduce_axis0(34, 130, 32, 32, clear=False),
-        _tail_reduce_axis0(34, 130, 32, 32, dtype="float16"),
-        _tail_reduce_axis0(34, 130, 32, 32, real_shape=[31, 32]),
+        (
+            _tail_reduce_axis0(34, 130, 32, 32, clear=False),
+            _native_reduce_marker("sum", target="ascendc", dtype="float", clear=False),
+        ),
+        (
+            _tail_reduce_axis0(34, 130, 32, 32, dtype="float16"),
+            _native_reduce_marker("sum", target="ascendc", dtype="float16"),
+        ),
+        (
+            _tail_reduce_axis0(34, 130, 32, 32, real_shape=[31, 32]),
+            _native_reduce_marker("sum", target="ascendc", dtype="float"),
+        ),
     ],
     ids=["clear_false", "float16", "real_shape_mismatch"],
 )
-def test_unsupported_tail_reduce_contracts_fall_back(func):
+def test_unsupported_tail_reduce_contracts_fall_back(func, native_marker):
     src = _source(func, target="ascendc")
     assert "tl::ascend::tail_reduce" not in src, src
-    assert _native_reduce_marker("sum") in src, src
+    assert native_marker in src, src
 
 
 def test_tail_reduce_flag_off_emits_no_tail_helper():
@@ -341,7 +362,7 @@ def test_tail_reduce_flag_off_emits_no_tail_helper():
     src_off = _source(func, target="ascendc", tail_mask=False)
     assert "tl::ascend::tail_reduce_sum" in src_on, src_on
     assert "tl::ascend::tail_reduce" not in src_off, src_off
-    assert _native_reduce_marker("sum") in src_off, src_off
+    assert _native_reduce_marker("sum", target="ascendc", dtype="float") in src_off, src_off
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
