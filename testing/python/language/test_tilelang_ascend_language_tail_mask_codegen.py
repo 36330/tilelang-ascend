@@ -447,6 +447,7 @@ def test_unsupported_tail_reduce_contracts_fall_back(target, kind, dtype, clear,
     assert _no_tail_marker(target) not in src, src
     assert _native_reduce_marker(kind, target=target, dtype=dtype, clear=clear, dim=0) in src, src
 
+
 @pytest.mark.parametrize(
     ("kind", "merge_marker"),
     [("sum", "TADD("), ("max", "TMAX("), ("min", "TMIN(")],
