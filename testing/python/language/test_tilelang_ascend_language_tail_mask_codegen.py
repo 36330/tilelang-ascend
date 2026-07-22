@@ -246,14 +246,21 @@ def _no_tail_marker(target):
     return "tl::ascend::tail_" if target == "ascendc" else "pto::DYNAMIC"
 
 
-def _native_reduce_marker(kind, *, target="ascendc", dtype="float", clear=True):
+def _native_reduce_marker(kind, *, target="ascendc", dtype="float", clear=True, dim=-1):
     """Return a backend-specific marker for a native reduce path."""
     if target == "pto":
+        direction = {
+            -1: "row",
+            0: "col",
+        }[dim]
         return {
-            "sum": "TADD(",
-            "max": "TMAX(",
-            "min": "TMIN(",
-        }[kind]
+            ("sum", "row"): "TROWSUM(",
+            ("sum", "col"): "TCOLSUM(",
+            ("max", "row"): "TROWMAX(",
+            ("max", "col"): "TCOLMAX(",
+            ("min", "row"): "TROWMIN(",
+            ("min", "col"): "TCOLMIN(",
+        }[(kind, direction)]
 
     # AscendC uses a dedicated helper for clear=true float16 sum reductions.
     if kind == "sum" and dtype == "float16" and clear:
@@ -329,7 +336,7 @@ def test_unsupported_reduce_clears_downstream_tail_state():
 def test_tail_reduce_sum_not_rewritten_for_pto():
     src = _source(_tail_reduce_axis0(34, 130, 32, 32), target="pto")
     assert _no_tail_marker("pto") not in src, src
-    assert _native_reduce_marker("sum", target="pto") in src, src
+    assert _native_reduce_marker("sum", target="pto", dim=0) in src, src
 
 
 @pytest.mark.parametrize(
