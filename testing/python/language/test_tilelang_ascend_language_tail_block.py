@@ -42,11 +42,13 @@ mechanism: the PTO backend emits ``PadValue::Null`` for sliced loads
       (ub2gm re-clamps the store) -> pad_value is irrelevant, default 0 is fine.
     * CUBE gemm K-tail           : the L1 tail is implicitly 0, and 0 * B = 0,
       so the matmul stays correct.
-    * reduce                     : the tail WOULD corrupt the result, so the
-      reduce must be told its logical valid extent via ``real_shape=[rows, cols]``
-      (reduce_ascend.py) and never reads the tail at all. Relying on a -inf
-      pad instead produces inf/nan on NPU (verified) because PTO does not pad
-      sliced loads. ``test_reduce_max_tail`` guards the ``real_shape`` path.
+    * reduce                     : native fallback reductions must be told their
+      logical valid extent via ``real_shape=[rows, cols]`` (reduce_ascend.py).
+      With ``TL_ASCEND_TAIL_MASK``, the guarded axis-0 float32 contract instead
+      carries the runtime valid rectangle into backend-native reduction code.
+      Relying on a -inf pad produces inf/nan on NPU (verified) because PTO does
+      not pad sliced loads. ``test_reduce_max_tail`` guards the real_shape
+      fallback; Group 2d guards the valid-region rewrite.
 
 NOTE: these cases execute on real NPU hardware (``.npu()``); they cannot run in a
 CPU-only environment. Risk levels are annotated per group so unsupported
@@ -341,9 +343,8 @@ reduce_tail_configs = [
 ]
 
 
-# For AscendC, reduce rewriting is enabled, but this explicit real_shape does
-# not match the physical tile and therefore stays on the native real_shape
-# path. PTO disables reduce rewriting at the phase level.
+# With tail-mask enabled, this explicit real_shape does not match the physical
+# tile and therefore stays on the native real_shape path on both backends.
 @pytest.mark.parametrize("tail_mask", [False, True])
 @pytest.mark.parametrize("dtype", ["float"])
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
@@ -353,7 +354,7 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 
 
 # =============================================================================
-# Group 2d - AscendC axis-0 tail reductions   [risk: high]
+# Group 2d - AscendC/PTO axis-0 tail reductions   [risk: high]
 # Covers sum/max/min with clear=true. Each tile writes one partial
 # reduction, so different blocks never race on the output.
 # =============================================================================
@@ -394,13 +395,20 @@ reduce_axis0_configs = [
     (65, 130, 64, 32),  # larger physical row with a one-row tail
 ]
 
+REDUCE_TAIL_TARGETS = ("ascendc", "pto")
+REDUCE_TAIL_KINDS = ("sum", "max", "min")
+REDUCE_TAIL_AXIS0_DIMS = (0, -2)
 
-@pytest.mark.parametrize("kind", ["sum", "max", "min"])
-@pytest.mark.parametrize("dim", [0, -2])
+
+@pytest.mark.parametrize("kind", REDUCE_TAIL_KINDS)
+@pytest.mark.parametrize("dim", REDUCE_TAIL_AXIS0_DIMS)
+@pytest.mark.parametrize("target", REDUCE_TAIL_TARGETS)
 @pytest.mark.parametrize("M,N,block_M,block_N", reduce_axis0_configs)
-def test_reduce_axis0_tail_ascendc(M, N, block_M, block_N, kind, dim):
+def test_reduce_axis0_tail(M, N, block_M, block_N, target, kind, dim):
     func = reduce_axis0_tail(M, N, block_M, block_N, kind, dim=dim)
-    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc")
+    func = tilelang.compile(
+        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target
+    )
 
     torch.manual_seed(0)
     a = torch.randn(M, N, dtype=torch.float32).npu()
@@ -415,11 +423,35 @@ def test_reduce_axis0_tail_ascendc(M, N, block_M, block_N, kind, dim):
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize(("kind", "sign"), [("max", -1.0), ("min", 1.0)])
+@pytest.mark.parametrize("target", REDUCE_TAIL_TARGETS)
+def test_reduce_axis0_tail_does_not_consume_zero_padding(target, kind, sign):
+    """Guard max/min against treating the zero-filled physical tail as data."""
+    M, N, block_M, block_N = 3, 8, 4, 8
+    func = reduce_axis0_tail(M, N, block_M, block_N, kind)
+    func = tilelang.compile(
+        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target
+    )
+
+    base = torch.arange(1, M * N + 1, dtype=torch.float32).reshape(M, N)
+    a = (base * sign).npu()
+    out = func(a)[0]
+    reduced = getattr(a, kind)(dim=0)
+    ref = reduced.values
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+# NaN propagation and signed-zero tie-breaking are backend-instruction
+# semantics rather than part of the shared valid-region contract. Keep this
+# exact-bit regression scoped to the AscendC helper until PTO documents and
+# validates an equivalent guarantee on hardware.
 @pytest.mark.parametrize("kind", ["sum", "max", "min"])
 def test_reduce_axis0_special_values_ascendc(kind):
     M, N, block_M, block_N = 3, 8, 4, 8
     func = reduce_axis0_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc")
+    func = tilelang.compile(
+        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc"
+    )
 
     a = torch.tensor(
         [

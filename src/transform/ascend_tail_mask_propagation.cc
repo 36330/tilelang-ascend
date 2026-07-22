@@ -135,8 +135,8 @@ public:
 private:
   // Per UB data Var -> current valid region. Absent => full (untracked).
   std::unordered_map<const VarNode *, TailMaskInfo> state_;
-  // Whether reduce ops may be rewritten to tail_reduce. Disabled for the PTO
-  // backend, whose reduce codegen handles valid shapes natively.
+  // Whether reduce ops may be rewritten to tail_reduce. The caller enables
+  // this only for backends with a dedicated tail-reduce lowering.
   bool rewrite_reduce_ = true;
 
   // --- loop-variable scope tracking ---------------------------------------
@@ -399,8 +399,9 @@ private:
     TailMaskInfo in = GetMask(GetPtrVar(call->args[2]));
 
     // Reduce is rewritten to a valid-region tail_reduce (which needs no pad)
-    // only on the AscendC backend, for a clean 2D float tile. On PTO, or for
-    // 3D / int tiles, it stays the native reduce over the pad-filled tile.
+    // only for a clean 2D float tile on a backend that supports the internal
+    // op. Unsupported contracts stay on the native reduce over the pad-filled
+    // tile.
     // The valid_row/valid_col must also not reference loop vars that have
     // already gone out of scope (e.g. a copy seeded inside `for by` whose
     // valid_col = f(by), but the reduce runs outside the loop).
