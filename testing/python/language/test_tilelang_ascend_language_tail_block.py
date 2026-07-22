@@ -406,9 +406,7 @@ REDUCE_TAIL_AXIS0_DIMS = (0, -2)
 @pytest.mark.parametrize("M,N,block_M,block_N", reduce_axis0_configs)
 def test_reduce_axis0_tail(M, N, block_M, block_N, target, kind, dim):
     func = reduce_axis0_tail(M, N, block_M, block_N, kind, dim=dim)
-    func = tilelang.compile(
-        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target
-    )
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target)
 
     torch.manual_seed(0)
     a = torch.randn(M, N, dtype=torch.float32).npu()
@@ -429,9 +427,7 @@ def test_reduce_axis0_tail_does_not_consume_zero_padding(target, kind, sign):
     """Guard max/min against treating the zero-filled physical tail as data."""
     M, N, block_M, block_N = 3, 8, 4, 8
     func = reduce_axis0_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(
-        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target
-    )
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target=target)
 
     base = torch.arange(1, M * N + 1, dtype=torch.float32).reshape(M, N)
     a = (base * sign).npu()
@@ -449,9 +445,7 @@ def test_reduce_axis0_tail_does_not_consume_zero_padding(target, kind, sign):
 def test_reduce_axis0_special_values_ascendc(kind):
     M, N, block_M, block_N = 3, 8, 4, 8
     func = reduce_axis0_tail(M, N, block_M, block_N, kind)
-    func = tilelang.compile(
-        func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc"
-    )
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=TAIL_REDUCE_PASS_CONFIGS, target="ascendc")
 
     a = torch.tensor(
         [
