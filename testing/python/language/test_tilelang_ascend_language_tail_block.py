@@ -70,11 +70,11 @@ VEC_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
 }
 
-# Tail reduction is a pure-vector kernel. Keep its configuration isolated from
-# CV combine/sync so this suite exercises only the passes required by reduce.
+# Tail reduction is a pure-vector kernel. Reuse the established vector pass
+# configuration so PTO mixed-target compilation scopes vector intrinsics to
+# the vector branch.
 TAIL_REDUCE_PASS_CONFIGS = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
-    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
+    **VEC_PASS_CONFIGS,
     tilelang.PassConfigKey.TL_ASCEND_TAIL_MASK: True,
 }
 
