@@ -126,13 +126,14 @@ def cube_matmul_tail(M, N, K, block_M, block_N, K_L1, dtype="float16", accum_dty
             B_L1 = T.alloc_L1((K_L1, block_N), dtype)
             C_L0 = T.alloc_L0C((block_M, block_N), accum_dtype)
 
-            loop_k = T.ceildiv(K, K_L1)
-            for k in T.serial(loop_k):
-                T.copy(A[bx * block_M, k * K_L1], A_L1)  # gm2l1: M & K tail
-                T.copy(B[k * K_L1, by * block_N], B_L1)  # gm2l1: K & N tail
-                T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
+            with T.Scope("C"):
+                loop_k = T.ceildiv(K, K_L1)
+                for k in T.serial(loop_k):
+                    T.copy(A[bx * block_M, k * K_L1], A_L1)  # gm2l1: M & K tail
+                    T.copy(B[k * K_L1, by * block_N], B_L1)  # gm2l1: K & N tail
+                    T.gemm_v0(A_L1, B_L1, C_L0, init=(k == 0))
 
-            T.copy(C_L0, C[bx * block_M, by * block_N])  # l0c2gm: M & N tail
+                T.copy(C_L0, C[bx * block_M, by * block_N])  # l0c2gm: M & N tail
 
     return main
 
@@ -494,31 +495,33 @@ def cv_matmul_add_tail(M, N, K, block_M, block_N, block_K, dtype="float16", accu
             d_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
             c_ub = T.alloc_ub((block_M // VEC_NUM, block_N), dtype)
 
-            loop_k = T.ceildiv(K, block_K)
-            for k in T.serial(loop_k):
-                T.copy(A[bx * block_M, k * block_K], A_L1)  # gm2l1: M & K tail
-                T.copy(B[k * block_K, by * block_N], B_L1)  # gm2l1: K & N tail
+            with T.Scope("C"):
+                loop_k = T.ceildiv(K, block_K)
+                for k in T.serial(loop_k):
+                    T.copy(A[bx * block_M, k * block_K], A_L1)  # gm2l1: M & K tail
+                    T.copy(B[k * block_K, by * block_N], B_L1)  # gm2l1: K & N tail
+
+                    T.barrier_all()
+                    if k == 0:
+                        T.gemm_v0(A_L1, B_L1, C_L0, init=True)
+                    else:
+                        T.gemm_v0(A_L1, B_L1, C_L0)
+                    T.barrier_all()
+
+                T.copy(C_L0, C[bx * block_M, by * block_N])  # l0c2gm: M & N tail
+                T.set_cross_flag("FIX", 0)
+
+            with T.Scope("V"):
+                T.wait_cross_flag(0)
+
+                T.copy(C[bx * block_M + vid * block_M // VEC_NUM, by * block_N], c_ub)  # gm2ub tail
+                T.copy(D[bx * block_M + vid * block_M // VEC_NUM, by * block_N], d_ub)
 
                 T.barrier_all()
-                if k == 0:
-                    T.gemm_v0(A_L1, B_L1, C_L0, init=True)
-                else:
-                    T.gemm_v0(A_L1, B_L1, C_L0)
+                T.tile.add(c_ub, c_ub, d_ub)
                 T.barrier_all()
 
-            T.copy(C_L0, C[bx * block_M, by * block_N])  # l0c2gm: M & N tail
-            T.set_cross_flag("FIX", 0)
-
-            T.wait_cross_flag(0)
-
-            T.copy(C[bx * block_M + vid * block_M // VEC_NUM, by * block_N], c_ub)  # gm2ub tail
-            T.copy(D[bx * block_M + vid * block_M // VEC_NUM, by * block_N], d_ub)
-
-            T.barrier_all()
-            T.tile.add(c_ub, c_ub, d_ub)
-            T.barrier_all()
-
-            T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])  # ub2gm tail
+                T.copy(c_ub, C[bx * block_M + vid * block_M // VEC_NUM, by * block_N])  # ub2gm tail
 
     return main
 
