@@ -35,6 +35,24 @@ private:
   bool enRelu;
   bool transposeL1;
   PrimExpr padValue;
+  Buffer tmp;
+  Array<Range> tmp_range;
+  Array<PrimExpr> tmp_extents;
+  // L0C->GM fixpipe unitFlag (default 0 = a standalone fixpipe). Threaded into
+  // copy_l0c_to_gm so a kernel-driven fixpipe can pair with the preceding mma's
+  // unitFlag and overlap across an L0C ping-pong.
+  PrimExpr unitFlag;
+  // L1->L0 runtime contraction length (default 0 = take the K extent from the
+  // destination L0 buffer). Overrides copy_l1_to_l0a's dstN / copy_l1_to_l0b's
+  // dstM so the loaded fractal matches a following mma's runtime K -- a
+  // full-width load feeding a shorter mma otherwise reads mismatched fractals.
+  PrimExpr realK;
+  // L1->L0B runtime output width (default 0 = take N from the destination L0
+  // buffer). The other axis of what realK covers: L0B's fractal derives its
+  // K-block stride from the column count, so a full-width load followed by a
+  // shorter mma addresses the wrong K-blocks. Applies to matrix_b only, since
+  // matrix_a is [M, K] and has no N.
+  PrimExpr realN;
 };
 
 class AscendAtomicAdd : public Operator {
@@ -196,10 +214,6 @@ TVM_DLL const Op &ascend_dump_tensor();
 
 TVM_DLL const Op &ascend_src_code();
 
-TVM_DLL const Op &ascend_copy_cv_experiment();
-
-TVM_DLL const Op &ascend_copy_vc_experiment();
-
 TVM_DLL const Op &ascend_bilinear_interpolation();
 
 TVM_DLL const Op &ascend_wholereducemax();
@@ -260,6 +274,8 @@ TVM_DLL const Op &ascend_row_expand_sub_experiment();
 
 TVM_DLL const Op &ascend_row_expand_div_experiment();
 
+TVM_DLL const Op &ascend_exp_experiment();
+
 // ---------------------------------------------------------------------------
 // Internal tail-aware vector ops produced by AscendTailMaskPropagation. These
 // are never emitted by the front-end; the pass rewrites the corresponding
@@ -276,8 +292,11 @@ TVM_DLL const Op &ascend_tail_scalar();
 
 TVM_DLL const Op &ascend_tail_reduce();
 
-TVM_DLL const Op &ascend_cumsum();
+TVM_DLL const Op &ascend_copy_cv_experiment();
 
+TVM_DLL const Op &ascend_copy_vc_experiment();
+
+TVM_DLL const Op &ascend_cumsum();
 } // namespace tl
 } // namespace tvm
 

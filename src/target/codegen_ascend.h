@@ -161,6 +161,8 @@ private:
   void RowExpandBinOpExperimentCodegen(const CallNode *op,
                                        const std::string &mask_op_name);
 
+  void ExpExperimentCodegen(const CallNode *op);
+
   void SetCrossFlagCodegen(const CallNode *op);
 
   void FlagOpCodegen(const CallNode *op, std::string op_name);
@@ -172,6 +174,8 @@ private:
   void PrintfOpCodegen(const CallNode *op, const std::string &op_name);
 
   void DumpTensorCodegen(const CallNode *op);
+
+  void SrcCodeCodegen(const CallNode *op);
 
   void BilinearInterpolationCodegen(const CallNode *op);
 
