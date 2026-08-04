@@ -223,9 +223,7 @@ private:
 
   void BrcbExperimentCodegen(const CallNode *op);
 
-  //////
   void CumSumOpCodegen(const CallNode *op);
-  //////
 
 private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.

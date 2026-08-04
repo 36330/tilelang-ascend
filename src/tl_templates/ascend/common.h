@@ -540,7 +540,6 @@ reduce_sum(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
 }
 
 
-//////
 template <typename T>
 CATLASS_DEVICE void abs_contiguous(LocalTensor<T> dstTensor,
                                    LocalTensor<T> srcTensor,
@@ -565,7 +564,6 @@ CATLASS_DEVICE void abs_contiguous(LocalTensor<T> dstTensor,
         {1, 1, 8, 8});
   }
 }
-
 
 template <typename T, uint32_t M, uint32_t N, int32_t dim>
 CATLASS_DEVICE void reduce_abssum(LocalTensor<T> const &dstTensor,
@@ -656,7 +654,6 @@ CATLASS_DEVICE void cumsum(LocalTensor<T> dstTensor,
         cumSumInfo);
   }
 }
-//////
 
 template <typename T>
 CATLASS_DEVICE T reduce_scalar_max_safe(T lhsValue, T rhsValue) {
