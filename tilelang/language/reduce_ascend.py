@@ -474,7 +474,15 @@ def reduce_sum(
     """
     parsed_clear, parsed_real_shape = _parse_reduce_optional_args("reduce_sum", args, clear=clear, real_shape=real_shape)
     legalized_dim = _legalize_reduce_dim(_get_buffer_extent(buffer), dim)
-    return _reduce_with_clear(buffer, out, "reduce_sum", legalized_dim, parsed_clear, parsed_real_shape)
+    return _reduce_with_clear(
+        buffer,
+        out,
+        "reduce_sum",
+        legalized_dim,
+        parsed_clear,
+        parsed_real_shape,
+        tmp=tmp,
+    )
 
 
 def reduce_abssum(
