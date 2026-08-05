@@ -3,14 +3,24 @@ from tilelang import DataType, language as T
 import argparse
 import torch
 
-B, S, H, D = 1, 128, 1, 512
+"""
+out_idx=[3]：第 3 号参数是输出张量。
+这里 main 参数顺序是 Q=0, K=1, V=2, Output=3，
+所以调用时通常只传 q,k,v，Output 由 runtime 自动分配并返回。
+
+workspace_idx=[4,5,6]：第 4/5/6 号参数是临时 workspace，
+也自动分配，不需要用户手动传入。
+"""
+
+
+B, S, H, D = 2, 128, 2, 512
 
 @tilelang.jit(out_idx=[3], workspace_idx=[4,5,6])
 def flash_attention_fwd(
     batch,
     seq_len,
     heads,
-    dim,
+    dim
 ):
     block_M, block_N = 64, 64
 
@@ -20,7 +30,7 @@ def flash_attention_fwd(
     sm_scale = (1.0 / dim)**0.5
 
     shape = [batch, heads, seq_len, dim]
-
+    # seqlen 维度的并行
     block_num = seq_len // block_M * heads * batch
 
     @T.prim_func
@@ -34,17 +44,18 @@ def flash_attention_fwd(
             workspace_3: T.Tensor([block_num, block_M, dim], accum_dtype),       # type: ignore
     ):
         with T.Kernel(block_num, is_npu=True) as (cid, vid):
-            bx = cid % (seq_len // block_M)
-            by = cid // (seq_len // block_M) % heads
-            bz = cid // (seq_len // block_M) // heads % batch
+            bx = cid % (seq_len // block_M) # 定位第几个 seq block
+            by = cid // (seq_len // block_M) % heads # 定位第几个 head
+            bz = cid // (seq_len // block_M) // heads % batch # 定位第几个 batch
 
             q_l1 = T.alloc_L1([block_M, dim], dtype)
             k_l1 = T.alloc_L1([block_N, dim], dtype)
             v_l1 = T.alloc_L1([block_N, dim], dtype)
 
             acc_s_l1 = T.alloc_L1([block_M, block_N], dtype)
-
+            # acc_s_l0c 存储 Q @ K^T 结果
             acc_s_l0c = T.alloc_L0C([block_M, block_N], accum_dtype)
+            # acc_s_l0c 存储 output的 一块的结果
             acc_o_l0c = T.alloc_L0C([block_M, dim], accum_dtype)
 
             acc_o = T.alloc_ub([block_M // 2, dim], accum_dtype)
@@ -135,22 +146,23 @@ def flash_attention_fwd(
 
                     T.tile.add(acc_s_ub, acc_s_ub, acc_s_ub_)
                     T.barrier_all()
-
+                    # QK^T * sm_scale
                     T.tile.mul(acc_s_ub, acc_s_ub, sm_scale)
                     T.barrier_all()
-
+                    # acc_s_ub 的每一行的最大值
                     T.reduce_max(acc_s_ub, m_i, dim=-1)
                     T.barrier_all()
-
+                    # 最新的最大值
                     T.tile.max(m_i, m_i, m_i_prev)
                     T.barrier_all()
-
+                    # 之前的最大值减去最新的最大值，这是一个更新系数
                     T.tile.sub(m_i_prev, m_i_prev, m_i)
                     T.barrier_all()
-
+                    # 之前的最大值减去最新的最大值再求exp，这是一个更新系数
                     T.tile.exp(m_i_prev, m_i_prev)
                     T.barrier_all()
 
+                    # 每一行减去当前最大值
                     for h_i in range(block_M // 2):
                         T.barrier_all()
                         T.tile.sub(acc_s_ub[h_i, :], acc_s_ub[h_i, :], m_i[h_i])  # -
@@ -158,13 +170,13 @@ def flash_attention_fwd(
 
                     T.tile.exp(acc_s_ub, acc_s_ub)
                     T.barrier_all()
-
+                    # 当前的这一部分的分母和 sumexp_i_ub
                     T.reduce_sum(acc_s_ub, sumexp_i_ub, dim=-1)
                     T.barrier_all()
-
+                    # sumexp_new = sumexp_old * exp(m_old - m_new) + sum(exp(score_block - m_new))
                     T.tile.mul(sumexp, sumexp, m_i_prev)  # check
                     T.barrier_all()
-
+                    # sumexp 是更新后的分母和（即用当前的最大值计算出来的全部的到目前为止的所有的数据的分母和）
                     T.tile.add(sumexp, sumexp, sumexp_i_ub)
                     T.barrier_all()
 
@@ -209,6 +221,9 @@ def flash_attention_fwd(
                                        vid * block_M // 2 + block_M // 2, :])
 
     return main
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
