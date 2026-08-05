@@ -4385,6 +4385,8 @@ def run_test_transpose(M, N, block_M, block_N, dtype, target):
     dtype_map = {
         "float": torch.float32,
         "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "int8": torch.int8,
         "int16": torch.int16,
         "int32": torch.int32,
         "uint16": torch.uint16,
@@ -4392,10 +4394,10 @@ def run_test_transpose(M, N, block_M, block_N, dtype, target):
     }
     torch_dtype = dtype_map.get(dtype, torch.float32)
 
-    if dtype in ["int16", "int32", "uint16", "uint32"]:
-        a = torch.randint(
-            -100 if dtype in ["int16", "int32"] else 0, 100 if dtype in ["int16", "int32"] else 200, (M, N), dtype=torch_dtype
-        ).npu()
+    if dtype in ["int8", "int16", "int32", "uint16", "uint32"]:
+        lo = -100 if dtype in ["int8", "int16", "int32"] else 0
+        hi = 100 if dtype in ["int8", "int16", "int32"] else 200
+        a = torch.randint(lo, hi, (M, N), dtype=torch_dtype).npu()
     else:
         a = torch.randn(M, N, dtype=torch_dtype).npu()
 
@@ -4437,6 +4439,57 @@ def test_transpose(dtype, target, shape):
 def test_transpose_tiled(dtype, target, shape):
     M, N = shape
     run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("shape", [(48, 48), (16, 48), (48, 16), (128, 128)])
+def test_transpose_block_b16(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["float", "uint32", "uint16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("shape", [(16, 16), (32, 32)])
+def test_transpose_block_b32(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype,target", [("int8", "ascendc"), ("bfloat16", "ascendc")])
+@pytest.mark.parametrize("shape", [(32, 32)])
+def test_transpose_fallback_dtype(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize("target", ["ascendc"])
+@pytest.mark.parametrize("shape", [(16, 16)])
+def test_transpose_fallback_dtype_16x16(dtype, target, shape):
+    M, N = shape
+    run_test_transpose(M, N, M, N, dtype, target)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((20, 36), "float16"),
+        ((17, 33), "float16"),
+        ((24, 40), "float16"),
+        ((16, 33), "float16"),
+        ((33, 16), "float16"),
+        ((16, 16), "int8"),
+    ],
+    ids=["20x36-f16", "17x33-f16", "24x40-f16", "16x33-f16", "33x16-f16", "16x16-i8"],
+)
+def test_transpose_non_aligned_shape_raises(shape, dtype):
+    M, N = shape
+    src = tir.decl_buffer((M, N), dtype)
+    dst = tir.decl_buffer((N, M), dtype)
+    with pytest.raises(ValueError, match="32-byte alignment"):
+        T.tile.transpose(dst, src)
 
 
 def wholereducemax(M, N, block_M, block_N, mask, repeatTimes, dstRepStride, srcBlkStride, srcRepStride, dtype="float16"):
@@ -5082,6 +5135,110 @@ def row_expand_sub_experiment_kernel(M, N, dtype="float16"):
 
 def row_expand_div_experiment_kernel(M, N, dtype="float16"):
     return _row_expand_binop_experiment_kernel(M, N, "row_expand_div_experiment", dtype)
+
+
+def row_expand_mul_multistage_region_kernel():
+    stages = 2
+    rows_per_stage = 8
+    cols = 64
+    lanes = 8
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((stages, rows_per_stage, cols), "float"),  # type: ignore
+        Packed: T.Tensor((stages, rows_per_stage, lanes), "float"),  # type: ignore
+        C: T.Tensor((stages, rows_per_stage, cols), "float"),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True):
+            a_ring = T.alloc_ub((stages + 1, rows_per_stage, cols), "float")
+            packed_ring = T.alloc_ub((stages + 1, rows_per_stage, lanes), "float")
+            c_ring = T.alloc_ub((stages + 1, rows_per_stage, cols), "float")
+
+            for stage in T.serial(stages):
+                T.copy(A[stage, :, :], a_ring[stage + 1, :, :])
+                T.copy(Packed[stage, :, :], packed_ring[stage + 1, :, :])
+            T.tile.row_expand_mul_experiment(
+                c_ring[1:3, :, :],
+                a_ring[1:3, :, :],
+                packed_ring[1:3, :, :],
+            )
+            for stage in T.serial(stages):
+                T.copy(c_ring[stage + 1, :, :], C[stage, :, :])
+
+    return main
+
+
+def test_row_expand_experiment_folds_and_validates_regions():
+    op = T.tile.row_expand_mul_experiment
+    stage = tir.Var("stage", "int32")
+    dst_ring = tir.decl_buffer((3, 8, 64), "float32", scope="shared.ub")
+    src_ring = tir.decl_buffer((3, 8, 64), "float32", scope="shared.ub")
+    packed_ring = tir.decl_buffer((3, 8, 8), "float32", scope="shared.ub")
+
+    singleton = op(dst_ring[stage, :, :], src_ring[stage, :, :], packed_ring[stage, :, :])
+    multistage = op(dst_ring[1:3, :, :], src_ring[1:3, :, :], packed_ring[1:3, :, :])
+    whole_buffer = op(dst_ring, src_ring, packed_ring)
+
+    assert int(singleton.args[1].args[3]) == 8 * 64
+    assert int(singleton.args[3].args[3]) == 8 * 8
+    assert int(multistage.args[1].args[3]) == 2 * 8 * 64
+    assert int(multistage.args[3].args[3]) == 2 * 8 * 8
+    assert int(whole_buffer.args[1].args[3]) == 3 * 8 * 64
+    assert int(whole_buffer.args[3].args[3]) == 3 * 8 * 8
+
+    chunk = tir.Var("chunk", "int32")
+    wide_dst = tir.decl_buffer((8, 128), "float32", scope="shared.ub")
+    wide_src = tir.decl_buffer((8, 128), "float32", scope="shared.ub")
+    symbolic_window = op(
+        wide_dst[:, chunk * 64 : (chunk + 1) * 64],
+        wide_src[:, chunk * 64 : (chunk + 1) * 64],
+        tir.decl_buffer((8, 8), "float32", scope="shared.ub"),
+    )
+    assert int(symbolic_window.args[1].args[3]) == 8 * 64
+
+    dst = tir.decl_buffer((64, 64), "float32", scope="shared.ub")
+    src = tir.decl_buffer((64, 64), "float32", scope="shared.ub")
+    extra_rows = tir.decl_buffer((2, 64, 8), "float32", scope="shared.ub")
+    mismatch = r"src1 scalar count must match dst rows: src1=128, dst\[0\]=64"
+    with pytest.raises(ValueError, match=mismatch):
+        op(dst, src, extra_rows)
+
+    packed_ring = tir.decl_buffer((2, 128, 8), "float32", scope="shared.ub")
+    with pytest.raises(ValueError, match="must be contiguous when flattened"):
+        op(dst, src, packed_ring[0:2, 0:64, :])
+
+    scalar = tir.decl_buffer((64,), "float32", scope="shared.ub")
+    with pytest.raises(ValueError, match="packed src1 shape"):
+        op(dst, src, scalar)
+    with pytest.raises(ValueError, match="packed src1 shape"):
+        op(dst, src, scalar[:])
+
+    dst_fp16 = tir.decl_buffer((16, 128), "float16", scope="shared.ub")
+    src_fp16 = tir.decl_buffer((16, 128), "float16", scope="shared.ub")
+    scalar_ring = tir.decl_buffer((3, 8, 1), "float16", scope="shared.ub")
+    tmp_fp16 = tir.decl_buffer((16, 16), "float16", scope="shared.ub")
+    with pytest.raises(ValueError, match="32-byte-aligned access offset"):
+        op(dst_fp16, src_fp16, scalar_ring[1:3, :, :], tmp_fp16)
+
+
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+def test_row_expand_mul_experiment_multistage_region(target):
+    func = tilelang.compile(
+        row_expand_mul_multistage_region_kernel(),
+        out_idx=[-1],
+        pass_configs=pass_configs,
+        target=target,
+    )
+
+    a = torch.arange(1, 2 * 8 * 64 + 1, dtype=torch.float32).reshape(2, 8, 64) / 64
+    scalars = torch.arange(1, 2 * 8 + 1, dtype=torch.float32).reshape(2, 8) / 4
+    packed_scalars = scalars.unsqueeze(-1).expand(2, 8, 8).contiguous()
+
+    c = func(a.npu(), packed_scalars.npu())
+    torch.npu.synchronize()
+    ref_c = a * scalars.unsqueeze(-1)
+
+    torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype,shape", [("float16", (16, 128)), ("float", (16, 64))])

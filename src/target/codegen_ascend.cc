@@ -7,6 +7,7 @@
 
 #include "codegen_ascend.h"
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/tir/index_map.h>
 #include <tvm/tir/op.h>
@@ -18,6 +19,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "utils.h"
 
 #include "../op/ascend.h"
 #include "../op/builtin.h"
@@ -102,6 +105,9 @@ std::string CodeGenTileLangAscend::Finish() {
   decl_stream << "#include \"tl_templates/ascend/common.h\"\n";
   decl_stream << "#include \"acl/acl.h\"\n";
   decl_stream << "#include <runtime/rt_ffts.h>\n";
+  if (enable_exception_dump_) {
+    decl_stream << "#include \"tl_templates/ascend/exception_dump.h\"\n";
+  }
   decl_stream << "using namespace Catlass;\n";
   decl_stream << "using uint = unsigned int;\n";
   decl_stream << "using uchar = unsigned char;\n";
@@ -474,7 +480,12 @@ void CodeGenTileLangAscend::VisitExpr_(const BufferLoadNode *op,
   if (scope == "local.var") {
     os << var_name;
   } else {
-    os << var_name << ".GetValue(" << PrintExpr(op->indices.back()) << ")";
+    // Flatten every index, not just the innermost one: a scalar access into a
+    // multi-dimensional buffer such as table[b, i] otherwise drops the leading
+    // dimensions and aliases every row onto row 0. OffsetOf is the identity for
+    // a 1-D buffer, so single-dimension accesses are unchanged.
+    os << var_name << ".GetValue("
+       << PrintExpr(op->buffer.OffsetOf(op->indices).back()) << ")";
   }
 }
 
@@ -486,7 +497,8 @@ void CodeGenTileLangAscend::VisitStmt_(const BufferStoreNode *op) {
     this->PrintIndent();
     this->stream << var_name << " = " << value << ";\n";
   } else {
-    std::string index = PrintExpr(op->indices.back());
+    // See VisitExpr_(BufferLoadNode): flatten across all dimensions.
+    std::string index = PrintExpr(op->buffer.OffsetOf(op->indices).back());
     std::string value = PrintExpr(op->value);
     this->PrintIndent();
     this->stream << var_name << ".SetValue(" << index << ", " << value
@@ -761,20 +773,6 @@ void CodeGenTileLangAscend::VisitStmt_(const AttrStmtNode *op) {
       auto vec_id_ = AllocVarID(iv->var.get());
       this->PrintIndent();
       this->stream << "auto " << vec_id_ << " = AscendC::GetSubBlockIdx();\n";
-    }
-    this->VisitStmt(op->body);
-    return;
-  } else if (op->attr_key == "init_flag" || op->attr_key == "clear_flag") {
-    const StringImmNode *instn = op->value.as<StringImmNode>();
-
-    std::string inst = std::string(instn->value);
-    size_t st = 0;
-    for (size_t i = 0; i < inst.size(); ++i) {
-      if (inst[i] == '\n') {
-        this->PrintIndent();
-        stream << inst.substr(st, i - st) << "\n";
-        st = i + 1;
-      }
     }
     this->VisitStmt(op->body);
     return;
@@ -1151,6 +1149,46 @@ void CodeGenTileLangAscend::PrintHostFunc(
   os << "rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);\n";
   int func_scope = this->BeginScope();
   CallTilingInput(os, tiling_func_name, tiling_args, shape_vars);
+
+  if (enable_exception_dump_) {
+    os << "tilelang_register_exception_dump_callback();\n";
+    os << "ParamSizeInfo paramSizeInfo;\n";
+    os << "paramSizeInfo.magic = TILE_LANG_PARAM_INFO_MAGIC;\n";
+    os << "snprintf(paramSizeInfo.kernel_name, "
+          "sizeof(paramSizeInfo.kernel_name), \""
+       << name << "\");\n";
+    {
+      size_t tensor_idx = 0;
+      for (size_t i = 0; i < f->params.size(); ++i) {
+        auto v = f->params[i];
+        if (v.dtype().is_handle() &&
+            f->buffer_map.find(v) != f->buffer_map.end()) {
+          tir::Buffer buffer = f->buffer_map[v];
+          os << "paramSizeInfo.sizes[" << tensor_idx << "] = (size_t)(";
+          if (buffer->shape.size() == 0) {
+            os << "1";
+          }
+          for (size_t j = 0; j < buffer->shape.size(); j++) {
+            if (j > 0) {
+              os << " * ";
+            }
+            os << "(";
+            this->PrintExpr(buffer->shape[j], os);
+            os << ")";
+          }
+          size_t elem_bytes = (buffer->dtype.bits() + 7) / 8;
+          os << ") * " << elem_bytes << ";\n";
+          os << "paramSizeInfo.addr[" << tensor_idx << "] = (uint64_t)"
+             << v->name_hint << ";\n";
+          os << "paramSizeInfo.dataTypes[" << tensor_idx
+             << "] = " << tvm::tl::TVMDataTypeToACL(buffer->dtype) << ";\n";
+          tensor_idx++;
+        }
+      }
+      os << "paramSizeInfo.count = " << tensor_idx << ";\n";
+    }
+  }
+
   this->PrintIndent();
 
   os << name << "<<<" << core << ", nullptr, stream>>>(";
@@ -1169,7 +1207,11 @@ void CodeGenTileLangAscend::PrintHostFunc(
       os << ", ";
     }
   }
-  os << ", fftsAddr);\n";
+  if (enable_exception_dump_) {
+    os << ", fftsAddr, paramSizeInfo);\n";
+  } else {
+    os << ", fftsAddr);\n";
+  }
   os << "}\n";
   this->EndScope(func_scope);
   std::string content = os.str();
@@ -1188,6 +1230,10 @@ void CodeGenTileLangAscend::AddFunction(const GlobalVar &gvar,
   address_map_ = f->GetAttr<Map<Var, PrimExpr>>("address_map")
                      .value_or(Map<Var, PrimExpr>());
   use_swizzle_ = f->GetAttr<Bool>("use_swizzle").value_or(Bool(false));
+  enable_exception_dump_ =
+      tvm::transform::PassContext::Current()
+          ->GetConfig<Bool>(tvm::tl::kAscendExceptionDump, Bool(false))
+          .value();
   tiling_map_ = f->GetAttr<Map<Var, PrimExpr>>("tiling_map")
                     .value_or(Map<Var, PrimExpr>());
   var_sequence_ = f->GetAttr<Array<Var>>("var_sequence").value_or(Array<Var>());
@@ -1279,8 +1325,13 @@ void CodeGenTileLangAscend::AddFunction(const GlobalVar &gvar,
     }
     index++;
   }
-  stream << ", uint64_t fftsAddr";
-  stream << ") {\n";
+
+  if (enable_exception_dump_) {
+    stream << ", uint64_t fftsAddr, ParamSizeInfo paramSizeInfo) {\n";
+  } else {
+    stream << ", uint64_t fftsAddr) {\n";
+  }
+
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
   this->PrintStmt(f->body);
@@ -1959,6 +2010,16 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
 
   bool is_reduce_sum = (op_name.find("reduce_sum") != std::string::npos);
   int buffer_arg_end = static_cast<int>(op->args.size());
+  // Optional trailing physical row width, emitted only when the logical width
+  // is narrower than the row the data sits in (a sliced region, or a real_shape
+  // narrower than the buffer). It follows `clear`, so peel it off first.
+  int64_t physical_row = 0;
+  if (buffer_arg_end > 0 && !op->args[buffer_arg_end - 1].dtype().is_bool()) {
+    if (const auto *row_imm = op->args[buffer_arg_end - 1].as<IntImmNode>()) {
+      physical_row = row_imm->value;
+      buffer_arg_end--;
+    }
+  }
   bool clear = true;
   if (buffer_arg_end > 0 && op->args[buffer_arg_end - 1].dtype().is_bool()) {
     clear = !is_zero(op->args[buffer_arg_end - 1]);
@@ -1973,6 +2034,85 @@ void CodeGenTileLangAscend::ReduceOpCodegen(const CallNode *op) {
   }
 
   this->PrintIndent();
+
+  // Narrow row-reduce: the logical width is only part of a wider physical row,
+  // so the source cannot be walked as one contiguous M x N block. Route to the
+  // WholeReduce* helpers, which take an explicit per-repeat source stride.
+  if (physical_row > 0) {
+    size_t tpos1 = op_name.find("<");
+    size_t tpos2 = op_name.rfind(">");
+    std::string tparams = op_name.substr(tpos1 + 1, tpos2 - tpos1 - 1);
+    size_t c1 = tparams.find(",");
+    size_t c2 = tparams.find(",", c1 + 1);
+    size_t c3 = tparams.find(",", c2 + 1);
+    auto trim = [](std::string s) {
+      size_t b = s.find_first_not_of(" \t");
+      if (b == std::string::npos)
+        return std::string("");
+      return s.substr(b, s.find_last_not_of(" \t") - b + 1);
+    };
+    std::string ndtype = trim(tparams.substr(0, c1));
+    // The front end only attaches a physical row width once it has resolved the
+    // logical extents to constants, so these parse. Guard anyway: a symbolic
+    // extent reaching here would otherwise throw out of std::stoll and take the
+    // compiler down with it.
+    int64_t nm = 0, nn = 0, ndim = 0;
+    try {
+      nm = std::stoll(trim(tparams.substr(c1 + 1, c2 - c1 - 1)));
+      nn = std::stoll(trim(tparams.substr(c2 + 1, c3 - c2 - 1)));
+      ndim = std::stoll(trim(tparams.substr(c3 + 1)));
+    } catch (const std::exception &) {
+      LOG(FATAL) << "narrow reduce needs compile-time extents, but could not "
+                    "parse the template parameters: "
+                 << tparams;
+    }
+
+    // Enumerated rather than defaulted: guessing 4 bytes for an unrecognised
+    // type would silently scale the stride wrong instead of failing.
+    int64_t elem_bytes = 0;
+    if (ndtype == "float" || ndtype == "int32_t" || ndtype == "uint32_t") {
+      elem_bytes = 4;
+    } else if (ndtype == "half" || ndtype == "bfloat16_t" ||
+               ndtype == "int16_t" || ndtype == "uint16_t") {
+      elem_bytes = 2;
+    } else if (ndtype == "int8_t" || ndtype == "uint8_t" ||
+               ndtype == "float8_e4m3_t" || ndtype == "float8_e5m2_t") {
+      elem_bytes = 1;
+    }
+    ICHECK(elem_bytes > 0)
+        << "narrow reduce does not know the element size of '" << ndtype << "'";
+    ICHECK(ndim == -1) << "narrow reduce is only implemented for a row reduce "
+                          "(dim == -1); got dim "
+                       << ndim << " over a logical width of " << nn
+                       << " inside a physical row of " << physical_row;
+    ICHECK(nn * elem_bytes <= 256)
+        << "narrow reduce needs the logical width to fit one vector repeat "
+           "(256 "
+           "bytes); got "
+        << nn << " elements of " << elem_bytes << " bytes. Split the range and "
+        << "combine the partial results.";
+    ICHECK(clear) << "narrow reduce cannot merge into the destination "
+                     "(clear == false); reduce into a scratch and combine.";
+
+    std::string narrow = "reduce_max_narrow";
+    if (is_reduce_sum) {
+      narrow = "reduce_sum_narrow";
+    } else if (op_name.find("reduce_min") != std::string::npos) {
+      narrow = "reduce_min_narrow";
+    }
+    // srcRepStride steps one physical row, counted in 32-byte blocks, so the
+    // row has to be a whole number of them -- otherwise the division truncates
+    // and the reduce walks a stride that is short (or zero).
+    ICHECK((physical_row * elem_bytes) % 32 == 0)
+        << "narrow reduce needs the physical row (" << physical_row
+        << " elements of " << elem_bytes
+        << " bytes) to be a multiple of the 32-byte block";
+    int64_t src_rep_stride = physical_row * elem_bytes / 32;
+    this->stream << "tl::ascend::" << narrow << "<" << ndtype << ">("
+                 << var_names[0] << ", " << var_names[1] << ", " << nn << ", "
+                 << nm << ", " << src_rep_stride << ");\n";
+    return;
+  }
 
   if (is_reduce_sum) {
     size_t pos1 = op_name.find("<");
@@ -2131,11 +2271,10 @@ void CodeGenTileLangAscend::RowExpandDivExperimentCodegen(const CallNode *op) {
 void CodeGenTileLangAscend::RowExpandBinOpExperimentCodegen(
     const CallNode *op, const std::string &mask_op_name) {
   // args[0] = op name string, args[1] = dst, args[2] = src0,
-  // args[3] = src1, args[4] = tmp (required for AscendC)
+  // args[3] = src1, args[4] = optional broadcast workspace.
   //
-  // AscendC path: src1 is 1D [R] scalars, but {mul,sub,div}_mask requires
-  // a 2D [R, elems_per_block] broadcast buffer. Use tmp as intermediate:
-  // brcb(src1 → tmp) then {op}_mask(dst, src0, tmp).
+  // With tmp, src1 is a scalar-linear [R] stream that brcb expands into
+  // [R, elems_per_block]. Without tmp, src1 already contains those blocks.
   DataType dtype = GetAccessPtrDtype(op->args[1].as<CallNode>());
   std::string type_str = getType(dtype);
   int elems_per_block = 32 / (dtype.bits() / 8);
@@ -2155,7 +2294,13 @@ void CodeGenTileLangAscend::RowExpandBinOpExperimentCodegen(
       cols = static_cast<int>(shape[shape.size() - 1].as<IntImmNode>()->value);
     }
   }
+  ICHECK_EQ(cols % elems_per_block, 0)
+      << "RowExpandBinOpExperimentCodegen: physical columns=" << cols
+      << " must be divisible by " << elems_per_block;
   int rep_stride = cols / elems_per_block;
+  ICHECK(rep_stride > 0 && rep_stride <= 255)
+      << "RowExpandBinOpExperimentCodegen: repeat stride=" << rep_stride
+      << " must fit uint8_t";
   int repeat_time = 0;
   if (auto *extent_imm = dst_access->args[3].as<IntImmNode>()) {
     int extent = static_cast<int>(extent_imm->value);
@@ -2172,12 +2317,13 @@ void CodeGenTileLangAscend::RowExpandBinOpExperimentCodegen(
   ICHECK(rows % 8 == 0)
       << "RowExpandBinOpExperimentCodegen: rows=" << rows
       << " must be a multiple of 8 (BRCB processes 8 scalars per repeat)";
+  ICHECK_LE(rows, 255) << "RowExpandBinOpExperimentCodegen: rows=" << rows
+                       << " must fit uint8_t";
   int brcb_repeat = rows / 8;
   ICHECK(rows > 0 && cols > 0)
       << "RowExpandBinOpExperimentCodegen: failed to derive rows/cols";
 
-  uint64_t mask0 = 0xFFFFFFFFFFFFFFFF;
-  uint64_t mask1 = (dtype.bits() == 16) ? 0xFFFFFFFFFFFFFFFF : 0;
+  const char *mask1 = (dtype.bits() == 16) ? "0xFFFFFFFFFFFFFFFF" : "0";
 
   std::string dst_name = PrintBufferOffset(op->args[1].as<CallNode>(), true);
   std::string src0_name = PrintBufferOffset(op->args[2].as<CallNode>(), true);
@@ -2345,7 +2491,7 @@ void CodeGenTileLangAscend::TailReduceOpCodegen(const CallNode *op) {
   std::string dtype = getType(GetAccessPtrDtype(op->args[1].as<CallNode>()));
   std::string out = PrintBufferOffset(op->args[1].as<CallNode>());
   std::string src = PrintBufferOffset(op->args[2].as<CallNode>());
-  std::string tmp = PrintBufferOffset(op->args[3].as<CallNode>(), false);
+  std::string tmp = PrintBufferOffset(op->args[3].as<CallNode>());
   // Bind valid-region expressions first (see TailUnaryOpCodegen).
   std::string dim_str = PrintExpr(op->args[4]);
   std::string vrow = PrintExpr(op->args[5]);
@@ -2580,8 +2726,13 @@ void CodeGenTileLangAscend::MmaCodegen(const CallNode *op) {
   this->PrintIndent();
   this->stream << op_name << "(" << a_name << "[" << a_offset << "]," << b_name
                << "[" << b_offset << "]," << c_name << "[" << c_offset << "], "
-               << PrintExpr(op->args[4]) << ", " << PrintExpr(op->args[5])
-               << ");\n";
+               << PrintExpr(op->args[4]) << ", " << PrintExpr(op->args[5]);
+  // Optional trailing args (n_actual, unitFlag). Absent for the legacy 6-arg
+  // form, where the template supplies n_actual = N and unitFlag = 0.
+  for (size_t i = 6; i < op->args.size(); ++i) {
+    this->stream << ", " << PrintExpr(op->args[i]);
+  }
+  this->stream << ");\n";
 }
 
 void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
@@ -2634,6 +2785,16 @@ void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
   }
 
   if (found) {
+    // The count above is the most a call can carry. Not every producer supplies
+    // all of them -- passes that rewrite a copy in place (AscendWorkspace-
+    // Reduction turning copy_l0c_to_ub into copy_l0c_to_gm, say) build their
+    // own argument list and stop at the ones they care about. Every trailing
+    // parameter has a C++ default that reproduces the old behaviour, so emit
+    // what is actually there rather than indexing past the end.
+    int available = static_cast<int>(op->args.size()) - 3;
+    if (extra_args > available) {
+      extra_args = available;
+    }
     std::vector<std::string> var_names;
     for (int i = 0; i < extra_args; ++i) {
       auto expr = op->args[3 + i];
@@ -2658,6 +2819,17 @@ void CodeGenTileLangAscend::CopyCodegen(const CallNode *op) {
     // natural owner of the tail-padding clear.
     if (op_name.find("copy_gm_to_l1") != std::string::npos) {
       this->stream << ", " << (is_zero(dst_offset_expr) ? "true" : "false");
+    }
+
+    // copy_l0c_to_gm's unitFlag rides at the end of the argument list rather
+    // than in call order: the list is shared with the PTO codegen, which reads
+    // the entries in between by position. Emit it where the C++ helper expects
+    // it. A producer that predates it leaves the template default of 0, which
+    // is a standalone fixpipe.
+    constexpr int kL0cToGmArgc = 10;
+    if (op_name.find("copy_l0c_to_gm") != std::string::npos &&
+        static_cast<int>(op->args.size()) >= kL0cToGmArgc) {
+      this->stream << ", " << PrintExpr(op->args[kL0cToGmArgc - 1]);
     }
 
     this->stream << ");\n";
