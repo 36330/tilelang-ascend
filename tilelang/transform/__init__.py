@@ -556,3 +556,11 @@ def InjectTmpBuffer(target: Target):
     ----
     """
     return _ffi_api.InjectTmpBuffer(target)  # type: ignore
+
+
+######
+def LowerSquareOp():
+    return _ffi_api.LowerSquareOp()
+
+
+######

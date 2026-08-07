@@ -10,7 +10,10 @@ from .ascend import _dtype, _get_tmp_arena_access_ptr, _retrieve_shape
 
 _REDUCE_KWARG_SENTINEL = object()
 
-__all__ = ["reduce", "reduce_sum", "reduce_max", "reduce_min"]
+# __all__ = ["reduce", "reduce_sum", "reduce_max", "reduce_min"]
+######
+__all__ = ["reduce", "reduce_sum", "reduce_max", "reduce_min", "reduce_abssum", "reduce_absmax", "cumsum"]
+######
 
 
 def _get_buffer_extent(object: Buffer | BufferRegion) -> list[int]:

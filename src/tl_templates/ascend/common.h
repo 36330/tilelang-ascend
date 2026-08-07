@@ -538,6 +538,101 @@ reduce_sum(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
     dstTensor.SetValue(i, static_cast<T>(reducedValue + dstBackup[i]));
   }
 }
+//////
+template <typename T>
+CATLASS_DEVICE void abs_contiguous(LocalTensor<T> dstTensor,
+                                   LocalTensor<T> srcTensor, uint32_t count) {
+  constexpr uint32_t kOneRepeatBytes = 256;
+  constexpr uint32_t kOneRepeatElems = kOneRepeatBytes / sizeof(T);
+  uint32_t repeatTime = count / kOneRepeatElems;
+  uint32_t tail = count % kOneRepeatElems;
+
+  if (repeatTime > 0) {
+    uint64_t mask = kOneRepeatElems;
+    AscendC::Abs(dstTensor, srcTensor, mask, repeatTime, {1, 1, 8, 8});
+  }
+
+  if (tail > 0) {
+    uint64_t mask = tail;
+    AscendC::Abs(dstTensor[repeatTime * kOneRepeatElems],
+                 srcTensor[repeatTime * kOneRepeatElems], mask, 1,
+                 {1, 1, 8, 8});
+  }
+}
+
+template <typename T, uint32_t M, uint32_t N, int32_t dim>
+CATLASS_DEVICE void
+reduce_abssum(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
+              LocalTensor<uint8_t> const &sharedTmpBuffer, bool clear = true) {
+  (void)clear;
+
+  constexpr uint32_t srcCount = M * N;
+  constexpr uint32_t absTmpBytes = srcCount * sizeof(T);
+
+  LocalTensor<T> absTmp = const_cast<LocalTensor<uint8_t> &>(sharedTmpBuffer)
+                              .template ReinterpretCast<T>();
+  LocalTensor<uint8_t> reduceTmp =
+      const_cast<LocalTensor<uint8_t> &>(sharedTmpBuffer)[absTmpBytes];
+
+  abs_contiguous<T>(absTmp, srcTensor, srcCount);
+
+  uint32_t shape[] = {M, N};
+  if constexpr (dim == -1) {
+    AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(dstTensor, absTmp,
+                                                        reduceTmp, shape, true);
+  } else {
+    AscendC::ReduceSum<T, AscendC::Pattern::Reduce::RA>(dstTensor, absTmp,
+                                                        reduceTmp, shape, true);
+  }
+}
+
+template <typename T, uint32_t M, uint32_t N, int32_t dim>
+CATLASS_DEVICE void
+reduce_absmax(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
+              LocalTensor<uint8_t> const &sharedTmpBuffer, bool clear = true) {
+  (void)clear;
+
+  constexpr uint32_t srcCount = M * N;
+  constexpr uint32_t absTmpBytes = srcCount * sizeof(T);
+
+  LocalTensor<T> absTmp = const_cast<LocalTensor<uint8_t> &>(sharedTmpBuffer)
+                              .template ReinterpretCast<T>();
+  LocalTensor<uint8_t> reduceTmp =
+      const_cast<LocalTensor<uint8_t> &>(sharedTmpBuffer)[absTmpBytes];
+
+  abs_contiguous<T>(absTmp, srcTensor, srcCount);
+
+  uint32_t shape[] = {M, N};
+  if constexpr (dim == -1) {
+    AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(dstTensor, absTmp,
+                                                        reduceTmp, shape, true);
+  } else {
+    AscendC::ReduceMax<T, AscendC::Pattern::Reduce::RA>(dstTensor, absTmp,
+                                                        reduceTmp, shape, true);
+  }
+}
+
+constexpr AscendC::CumSumConfig kCumSumLastAxisConfig{
+    true, false, true, AscendC::CumSumAlgorithm::CUMSUM_ALGORITHM_LINEBYLINE};
+
+constexpr AscendC::CumSumConfig kCumSumFirstAxisConfig{
+    false, false, true, AscendC::CumSumAlgorithm::CUMSUM_ALGORITHM_LINEBYLINE};
+
+template <typename T, uint32_t M, uint32_t N, int32_t dim>
+CATLASS_DEVICE void
+cumsum(LocalTensor<T> dstTensor, LocalTensor<T> lastRowTensor,
+       LocalTensor<T> srcTensor, LocalTensor<uint8_t> sharedTmpBuffer) {
+  const AscendC::CumSumInfo cumSumInfo{M, N};
+
+  if constexpr (dim == 1 || dim == -1) {
+    AscendC::CumSum<T, kCumSumLastAxisConfig>(
+        dstTensor, lastRowTensor, srcTensor, sharedTmpBuffer, cumSumInfo);
+  } else {
+    AscendC::CumSum<T, kCumSumFirstAxisConfig>(
+        dstTensor, lastRowTensor, srcTensor, sharedTmpBuffer, cumSumInfo);
+  }
+}
+//////
 
 template <typename T>
 CATLASS_DEVICE T reduce_scalar_max_safe(T lhsValue, T rhsValue) {
@@ -961,846 +1056,887 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
   AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
   for (uint32_t r = 1; r < validRow; ++r) {
     AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  // Multiplication by one preserves signed zero while initializing the first
-  // row; Adds(..., 0) may canonicalize -0.0 on device.
-  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-  for (uint32_t r = 1; r < validRow; ++r) {
-    AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  }
-}
-
-template <typename T>
-CATLASS_DEVICE void tail_reduce_max(LocalTensor<T> out, LocalTensor<T> src,
-                                    LocalTensor<uint8_t> tmp, int dim,
-                                    uint32_t validRow, uint32_t validCol,
-                                    uint32_t physCol, bool clear) {
-  (void)tmp;
-  (void)dim;
-  (void)clear;
-  if (validRow == 0 || validCol == 0)
-    return;
-  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-  for (uint32_t r = 1; r < validRow; ++r) {
-    AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-  for (uint32_t r = 1; r < validRow; ++r) {
-    AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  }
-}
-
-template <typename T>
-CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
-                                    LocalTensor<uint8_t> tmp, int dim,
-                                    uint32_t validRow, uint32_t validCol,
-                                    uint32_t physCol, bool clear) {
-  (void)tmp;
-  (void)dim;
-  (void)clear;
-  if (validRow == 0 || validCol == 0)
-    return;
-  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-  for (uint32_t r = 1; r < validRow; ++r) {
-    AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-  for (uint32_t r = 1; r < validRow; ++r) {
-    AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-  }
-}
-
-static constexpr uint32_t L0AB_EVENT = 0;
-
-template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
-          bool transpose_A = false, bool transpose_B = false,
-          uint32_t kL0Size = 128>
-CATLASS_DEVICE void
-gemm_v0(LocalTensor<T1> const &A, LocalTensor<T1> const &B,
-        LocalTensor<T2> const &C, // this must be located in l0c
-        AscendC::TBuf<AscendC::TPosition::A2> &l0a_,
-        AscendC::TBuf<AscendC::TPosition::B2> &l0b_, bool clear,
-        uint32_t n_actual = N) {
-  // n_actual: runtime output-column count (<= N), only honoured on the
-  // transpose_B (QK) path -- computes/loads just the real window columns
-  // instead of the full template N. Defaults to N, so all existing callers are
-  // byte-identical. Physical L0B/L0C layout and the template N/K stay
-  // compile-time; only "how many columns are actually computed" changes (dual
-  // to the runtime K already threaded through mma).
-  static_assert(kL0Size % 16 == 0, "kL0Size must be a multiple of 16");
-  // Elements per C0 block (32 bytes). Equals 16 only for half; for int8 it is
-  // 32, for float it is 8. The fractal (zN/zZ/nZ) K-stride used below to step
-  // between L0 K-tiles is ELE_NUM_PER_C0 * kL0Size, so hardcoding 16 breaks
-  // int8 (and any dtype where sizeof(T1) != 2) once kL0split > 1.
-  constexpr uint32_t ELE_NUM_PER_C0 = BYTE_PER_C0 / sizeof(T1);
-  constexpr uint32_t kL0split = (K + kL0Size - 1) / kL0Size;
-  auto l0a = l0a_.Get<T1>();
-  auto l0b = l0b_.Get<T1>();
-  uint32_t kL0Tail = K - (kL0split - 1) * kL0Size;
-  bool initflag = false;
-
-  // ---- N tiling -----------------------------------------------------------
-  // The B operand tile loaded into L0B is (kL0Size x nTile); L0B holds 64KB,
-  // and with the kL0 ping-pong the per-slot budget is 32KB. So a single mma
-  // over the whole N (l0b slot = N*kL0Size) overflows L0B once N is large
-  // (e.g. the PV matmul's N = headDim = 512 -> 512*128*2 = 128KB). Tile N into
-  // nTile columns just like the Ascend C reference (N_SPLIT_SIZE = 128): each
-  // tile loads its own (kL0Size x nTile) B sub-block and writes its own column
-  // band of the L0C accumulator. Only the non-transpose-B path is tiled; the
-  // transpose-B callers (e.g. QK with N = block_I <= 128) already fit, so they
-  // keep nTile == N (a single pass, byte-for-byte the original behaviour) and
-  // need no L1 column-offset formula. Compatibility: any existing caller with
-  // N <= nMaxByL0B (transpose or not) sees nL0split == 1 and identical codegen.
-  //
-  // Sub-tile offsets come straight from the catlass tla fractal layouts:
-  //   L0C column n0  ->  n0 * roundUp16(M)   (tla::MakeLayoutL0C N1 stride)
-  //   L1 zN B col n0 ->  n0 * roundUp16(K)   (tla::MakeLayout<zN>  C1 stride)
-  // both of which are consistent with the original K-offset
-  // B[kL0Idx*ELE_NUM_PER_C0*kL0Size] (zN K-row stride) already used below.
-  constexpr uint32_t nMaxByL0B = (32u * 1024u) / (kL0Size * sizeof(T1));
-  constexpr uint32_t nTile = (transpose_B || N <= nMaxByL0B) ? N : nMaxByL0B;
-  static_assert(transpose_B || (N % nTile == 0),
-                "gemm_v0 N-tiling requires N divisible by the N tile size");
-  constexpr uint32_t nL0split = N / nTile;
-  // L0A and L0B are each 64KB. The kL0/N ping-pong uses two slots only when
-  // there is more than one (N-tile, K-tile) step; a single step uses one slot
-  // and may occupy the whole 64KB -- which is why a transpose-B caller with a
-  // single K-tile and N up to 64KB/(kL0Size*sizeof(T)) fits (e.g. fp32 N=128 =
-  // 64KB). So the per-slot budget is 64KB for a single step, 32KB once the
-  // ping-pong actually alternates.
-  constexpr uint32_t kNumSteps = ((K + kL0Size - 1) / kL0Size) * nL0split;
-  constexpr uint32_t kL0Budget = (64u * 1024u) / (kNumSteps > 1 ? 2u : 1u);
-  // The B tile in L0B is (kL0Size x nTile) -- only the transpose-B path keeps
-  // nTile == N, so a large-N transpose-B caller could overflow its L0B slot.
-  static_assert(nTile * kL0Size * sizeof(T1) <= kL0Budget,
-                "gemm_v0: the (kL0Size x nTile) B tile does not fit its L0B "
-                "ping-pong slot");
-  // M is not tiled, so a large M would overflow its L0A slot.
-  static_assert(M * kL0Size * sizeof(T1) <= kL0Budget,
-                "gemm_v0: the (M x kL0Size) A tile does not fit its L0A "
-                "ping-pong slot");
-  // L0C is caller-allocated (the `C` operand) and holds the full (M x N)
-  // accumulator: roundUp16(M) * N * sizeof(T2). It must fit the target's L0C
-  // (A2/A3 128KB, A5 256KB) -- e.g. M=128, N=512, fp32 needs 256KB and only
-  // fits A5. Unlike the L0A/L0B guards above this can't be a static_assert
-  // here: L0C capacity is device-dependent, whereas L0A/L0B are 64KB on both
-  // archs (which is why those two use a literal budget). This device-side
-  // template has no arch macro or L0C-size constant to branch on
-  // (ASCEND_*_L0C_SIZE live in the host codegen), so a literal guard would
-  // reject a valid A5 caller or silently pass on A2/A3. The constraint is
-  // therefore documented here; the caller sizes its L0C tile accordingly.
-  constexpr uint32_t mRound = ((M + 15u) / 16u) * 16u;
-  constexpr uint32_t kRound = ((K + 15u) / 16u) * 16u;
-
-  // ---- Pipelined main loop. Prime/drain the L0A/L0B ping-pong buffers ONCE
-  // and let the ping-pong run continuously across the WHOLE (N-tile, K-tile)
-  // sequence (flattened by tileIdx). Each tile's L1->L0 load goes into the
-  // free buffer while the previous tile's mma runs, so N-tiles overlap with K
-  // exactly like the Ascend C matmul pipeline -- a per-N-tile drain (the first
-  // N-tiling version) instead serialised the tiles. For nL0split == 1 (every
-  // pre-existing caller, and the QK transpose-B path) tileIdx == kL0Idx, so
-  // this is byte-for-byte the original K ping-pong.
-  SetFlag<HardEvent::MTE2_MTE1>(L0AB_EVENT);
-  WaitFlag<HardEvent::MTE2_MTE1>(L0AB_EVENT);
-  SetFlag<HardEvent::FIX_M>(L0AB_EVENT);
-  WaitFlag<HardEvent::FIX_M>(L0AB_EVENT);
-
-  SetFlag<HardEvent::M_MTE1>(L0AB_EVENT);
-  SetFlag<HardEvent::M_MTE1>(L0AB_EVENT + 1);
-
-  uint32_t tileIdx = 0;
-  for (uint32_t nL0Idx = 0; nL0Idx < nL0split; nL0Idx++) {
-    // Non-transpose B is zN in L1: its column n0 lives at n0 * roundUp16(K)
-    // (the zN C1 stride), so this N-tile's B sub-block starts at
-    // nL0Idx*nTile*kRound. This column-offset formula is correct only for a zN
-    // B_L1; a different B layout would need a different per-column stride here.
-    uint32_t bNOffset = transpose_B ? 0u : (nL0Idx * nTile * kRound);
-    uint32_t cNOffset = nL0Idx * nTile * mRound;
-
-    for (uint32_t kL0Idx = 0; kL0Idx < kL0split; kL0Idx++) {
-      // clear THIS N-tile's C column band on its first K-tile (each band is an
-      // independent accumulation over K).
-      initflag = (clear && (kL0Idx == 0));
-      uint32_t kSize = (kL0Idx == kL0split - 1) ? kL0Tail : kL0Size;
-      uint32_t pp = (tileIdx & 1);
-
-      uint32_t l0a_base = pp * (M * kL0Size);
-      uint32_t l0b_base = pp * (nTile * kL0Size);
-
-      WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT + pp);
-      if constexpr (!transpose_A) {
-        tl::ascend::copy_l1_to_l0a<T1, M, K>(l0a[l0a_base],
-                                             A[kL0Idx * M * kL0Size], M, kSize);
-      } else {
-        tl::ascend::copy_l1_to_l0a<T1, K, M, true>(
-            l0a[l0a_base], A[kL0Idx * ELE_NUM_PER_C0 * kL0Size], M, kSize);
-      }
-      if constexpr (!transpose_B) {
-        tl::ascend::copy_l1_to_l0b<T1, K, N>(
-            l0b[l0b_base], B[bNOffset + kL0Idx * ELE_NUM_PER_C0 * kL0Size],
-            kSize, nTile);
-      } else {
-        // transpose_B (QK): load only the n_actual real output columns; the
-        // [n_actual:N] columns stay unloaded (masked downstream). n_actual
-        // defaults to N (full width) -> byte-identical for non-window callers.
-        tl::ascend::copy_l1_to_l0b<T1, N, K, true>(
-            l0b[l0b_base], B[kL0Idx * N * kL0Size], kSize, n_actual);
-      }
-      SetFlag<HardEvent::MTE1_M>(L0AB_EVENT + pp);
-      WaitFlag<HardEvent::MTE1_M>(L0AB_EVENT + pp);
-      PipeBarrier<PIPE_M>();
-      // transpose_B (QK) computes only n_actual columns (window width); the
-      // non-transpose path keeps the full template N (nTile per N-tile).
-      tl::ascend::mma<T1, T2, M, nTile>(l0a[l0a_base], l0b[l0b_base],
-                                        C[cNOffset], initflag, kSize,
-                                        transpose_B ? n_actual : nTile);
-      SetFlag<HardEvent::M_MTE1>(L0AB_EVENT + pp);
-      tileIdx++;
+    // Multiplication by one preserves signed zero while initializing the first
+    // row; Adds(..., 0) may canonicalize -0.0 on device.
+    AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+    for (uint32_t r = 1; r < validRow; ++r) {
+      AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
     }
   }
-  WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT);
-  WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT + 1);
 
-  SetFlag<HardEvent::MTE1_MTE2>(L0AB_EVENT);
-  WaitFlag<HardEvent::MTE1_MTE2>(L0AB_EVENT);
-  SetFlag<HardEvent::M_FIX>(L0AB_EVENT);
-  WaitFlag<HardEvent::M_FIX>(L0AB_EVENT);
-}
+  template <typename T>
+  CATLASS_DEVICE void tail_reduce_max(
+      LocalTensor<T> out, LocalTensor<T> src, LocalTensor<uint8_t> tmp, int dim,
+      uint32_t validRow, uint32_t validCol, uint32_t physCol, bool clear) {
+    (void)tmp;
+    (void)dim;
+    (void)clear;
+    if (validRow == 0 || validCol == 0)
+      return;
+    AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+    for (uint32_t r = 1; r < validRow; ++r) {
+      AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
+      AscendC::Muls(out, src, static_cast<T>(1),
+                    static_cast<int32_t>(validCol));
+      for (uint32_t r = 1; r < validRow; ++r) {
+        AscendC::Max(out, out, src[r * physCol],
+                     static_cast<int32_t>(validCol));
+      }
+    }
 
-// 2-way merge sort
-template <typename T>
-CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+    template <typename T>
+    CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
+                                        LocalTensor<uint8_t> tmp, int dim,
+                                        uint32_t validRow, uint32_t validCol,
+                                        uint32_t physCol, bool clear) {
+      (void)tmp;
+      (void)dim;
+      (void)clear;
+      if (validRow == 0 || validCol == 0)
+        return;
+      AscendC::Muls(out, src, static_cast<T>(1),
+                    static_cast<int32_t>(validCol));
+      for (uint32_t r = 1; r < validRow; ++r) {
+        AscendC::Min(out, out, src[r * physCol],
+                     static_cast<int32_t>(validCol));
+        AscendC::Muls(out, src, static_cast<T>(1),
+                      static_cast<int32_t>(validCol));
+        for (uint32_t r = 1; r < validRow; ++r) {
+          AscendC::Min(out, out, src[r * physCol],
+                       static_cast<int32_t>(validCol));
+        }
+      }
+
+      static constexpr uint32_t L0AB_EVENT = 0;
+
+      template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
+                bool transpose_A = false, bool transpose_B = false,
+                uint32_t kL0Size = 128>
+      CATLASS_DEVICE void gemm_v0(
+          LocalTensor<T1> const &A, LocalTensor<T1> const &B,
+          LocalTensor<T2> const &C, // this must be located in l0c
+          AscendC::TBuf<AscendC::TPosition::A2> &l0a_,
+          AscendC::TBuf<AscendC::TPosition::B2> &l0b_, bool clear,
+          uint32_t n_actual = N) {
+        // n_actual: runtime output-column count (<= N), only honoured on the
+        // transpose_B (QK) path -- computes/loads just the real window columns
+        // instead of the full template N. Defaults to N, so all existing
+        // callers are byte-identical. Physical L0B/L0C layout and the template
+        // N/K stay compile-time; only "how many columns are actually computed"
+        // changes (dual to the runtime K already threaded through mma).
+        static_assert(kL0Size % 16 == 0, "kL0Size must be a multiple of 16");
+        // Elements per C0 block (32 bytes). Equals 16 only for half; for int8
+        // it is 32, for float it is 8. The fractal (zN/zZ/nZ) K-stride used
+        // below to step between L0 K-tiles is ELE_NUM_PER_C0 * kL0Size, so
+        // hardcoding 16 breaks int8 (and any dtype where sizeof(T1) != 2) once
+        // kL0split > 1.
+        constexpr uint32_t ELE_NUM_PER_C0 = BYTE_PER_C0 / sizeof(T1);
+        constexpr uint32_t kL0split = (K + kL0Size - 1) / kL0Size;
+        auto l0a = l0a_.Get<T1>();
+        auto l0b = l0b_.Get<T1>();
+        uint32_t kL0Tail = K - (kL0split - 1) * kL0Size;
+        bool initflag = false;
+
+        // ---- N tiling
+        // ----------------------------------------------------------- The B
+        // operand tile loaded into L0B is (kL0Size x nTile); L0B holds 64KB,
+        // and with the kL0 ping-pong the per-slot budget is 32KB. So a single
+        // mma over the whole N (l0b slot = N*kL0Size) overflows L0B once N is
+        // large (e.g. the PV matmul's N = headDim = 512 -> 512*128*2 = 128KB).
+        // Tile N into nTile columns just like the Ascend C reference
+        // (N_SPLIT_SIZE = 128): each tile loads its own (kL0Size x nTile) B
+        // sub-block and writes its own column band of the L0C accumulator. Only
+        // the non-transpose-B path is tiled; the transpose-B callers (e.g. QK
+        // with N = block_I <= 128) already fit, so they keep nTile == N (a
+        // single pass, byte-for-byte the original behaviour) and need no L1
+        // column-offset formula. Compatibility: any existing caller with N <=
+        // nMaxByL0B (transpose or not) sees nL0split == 1 and identical
+        // codegen.
+        //
+        // Sub-tile offsets come straight from the catlass tla fractal layouts:
+        //   L0C column n0  ->  n0 * roundUp16(M)   (tla::MakeLayoutL0C N1
+        //   stride) L1 zN B col n0 ->  n0 * roundUp16(K)   (tla::MakeLayout<zN>
+        //   C1 stride)
+        // both of which are consistent with the original K-offset
+        // B[kL0Idx*ELE_NUM_PER_C0*kL0Size] (zN K-row stride) already used
+        // below.
+        constexpr uint32_t nMaxByL0B = (32u * 1024u) / (kL0Size * sizeof(T1));
+        constexpr uint32_t nTile =
+            (transpose_B || N <= nMaxByL0B) ? N : nMaxByL0B;
+        static_assert(
+            transpose_B || (N % nTile == 0),
+            "gemm_v0 N-tiling requires N divisible by the N tile size");
+        constexpr uint32_t nL0split = N / nTile;
+        // L0A and L0B are each 64KB. The kL0/N ping-pong uses two slots only
+        // when there is more than one (N-tile, K-tile) step; a single step uses
+        // one slot and may occupy the whole 64KB -- which is why a transpose-B
+        // caller with a single K-tile and N up to 64KB/(kL0Size*sizeof(T)) fits
+        // (e.g. fp32 N=128 = 64KB). So the per-slot budget is 64KB for a single
+        // step, 32KB once the ping-pong actually alternates.
+        constexpr uint32_t kNumSteps = ((K + kL0Size - 1) / kL0Size) * nL0split;
+        constexpr uint32_t kL0Budget =
+            (64u * 1024u) / (kNumSteps > 1 ? 2u : 1u);
+        // The B tile in L0B is (kL0Size x nTile) -- only the transpose-B path
+        // keeps nTile == N, so a large-N transpose-B caller could overflow its
+        // L0B slot.
+        static_assert(
+            nTile * kL0Size * sizeof(T1) <= kL0Budget,
+            "gemm_v0: the (kL0Size x nTile) B tile does not fit its L0B "
+            "ping-pong slot");
+        // M is not tiled, so a large M would overflow its L0A slot.
+        static_assert(M * kL0Size * sizeof(T1) <= kL0Budget,
+                      "gemm_v0: the (M x kL0Size) A tile does not fit its L0A "
+                      "ping-pong slot");
+        // L0C is caller-allocated (the `C` operand) and holds the full (M x N)
+        // accumulator: roundUp16(M) * N * sizeof(T2). It must fit the target's
+        // L0C (A2/A3 128KB, A5 256KB) -- e.g. M=128, N=512, fp32 needs 256KB
+        // and only fits A5. Unlike the L0A/L0B guards above this can't be a
+        // static_assert here: L0C capacity is device-dependent, whereas L0A/L0B
+        // are 64KB on both archs (which is why those two use a literal budget).
+        // This device-side template has no arch macro or L0C-size constant to
+        // branch on (ASCEND_*_L0C_SIZE live in the host codegen), so a literal
+        // guard would reject a valid A5 caller or silently pass on A2/A3. The
+        // constraint is therefore documented here; the caller sizes its L0C
+        // tile accordingly.
+        constexpr uint32_t mRound = ((M + 15u) / 16u) * 16u;
+        constexpr uint32_t kRound = ((K + 15u) / 16u) * 16u;
+
+        // ---- Pipelined main loop. Prime/drain the L0A/L0B ping-pong buffers
+        // ONCE and let the ping-pong run continuously across the WHOLE (N-tile,
+        // K-tile) sequence (flattened by tileIdx). Each tile's L1->L0 load goes
+        // into the free buffer while the previous tile's mma runs, so N-tiles
+        // overlap with K exactly like the Ascend C matmul pipeline -- a
+        // per-N-tile drain (the first N-tiling version) instead serialised the
+        // tiles. For nL0split == 1 (every pre-existing caller, and the QK
+        // transpose-B path) tileIdx == kL0Idx, so this is byte-for-byte the
+        // original K ping-pong.
+        SetFlag<HardEvent::MTE2_MTE1>(L0AB_EVENT);
+        WaitFlag<HardEvent::MTE2_MTE1>(L0AB_EVENT);
+        SetFlag<HardEvent::FIX_M>(L0AB_EVENT);
+        WaitFlag<HardEvent::FIX_M>(L0AB_EVENT);
+
+        SetFlag<HardEvent::M_MTE1>(L0AB_EVENT);
+        SetFlag<HardEvent::M_MTE1>(L0AB_EVENT + 1);
+
+        uint32_t tileIdx = 0;
+        for (uint32_t nL0Idx = 0; nL0Idx < nL0split; nL0Idx++) {
+          // Non-transpose B is zN in L1: its column n0 lives at n0 *
+          // roundUp16(K) (the zN C1 stride), so this N-tile's B sub-block
+          // starts at nL0Idx*nTile*kRound. This column-offset formula is
+          // correct only for a zN B_L1; a different B layout would need a
+          // different per-column stride here.
+          uint32_t bNOffset = transpose_B ? 0u : (nL0Idx * nTile * kRound);
+          uint32_t cNOffset = nL0Idx * nTile * mRound;
+
+          for (uint32_t kL0Idx = 0; kL0Idx < kL0split; kL0Idx++) {
+            // clear THIS N-tile's C column band on its first K-tile (each band
+            // is an independent accumulation over K).
+            initflag = (clear && (kL0Idx == 0));
+            uint32_t kSize = (kL0Idx == kL0split - 1) ? kL0Tail : kL0Size;
+            uint32_t pp = (tileIdx & 1);
+
+            uint32_t l0a_base = pp * (M * kL0Size);
+            uint32_t l0b_base = pp * (nTile * kL0Size);
+
+            WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT + pp);
+            if constexpr (!transpose_A) {
+              tl::ascend::copy_l1_to_l0a<T1, M, K>(
+                  l0a[l0a_base], A[kL0Idx * M * kL0Size], M, kSize);
+            } else {
+              tl::ascend::copy_l1_to_l0a<T1, K, M, true>(
+                  l0a[l0a_base], A[kL0Idx * ELE_NUM_PER_C0 * kL0Size], M,
+                  kSize);
+            }
+            if constexpr (!transpose_B) {
+              tl::ascend::copy_l1_to_l0b<T1, K, N>(
+                  l0b[l0b_base],
+                  B[bNOffset + kL0Idx * ELE_NUM_PER_C0 * kL0Size], kSize,
+                  nTile);
+            } else {
+              // transpose_B (QK): load only the n_actual real output columns;
+              // the [n_actual:N] columns stay unloaded (masked downstream).
+              // n_actual defaults to N (full width) -> byte-identical for
+              // non-window callers.
+              tl::ascend::copy_l1_to_l0b<T1, N, K, true>(
+                  l0b[l0b_base], B[kL0Idx * N * kL0Size], kSize, n_actual);
+            }
+            SetFlag<HardEvent::MTE1_M>(L0AB_EVENT + pp);
+            WaitFlag<HardEvent::MTE1_M>(L0AB_EVENT + pp);
+            PipeBarrier<PIPE_M>();
+            // transpose_B (QK) computes only n_actual columns (window width);
+            // the non-transpose path keeps the full template N (nTile per
+            // N-tile).
+            tl::ascend::mma<T1, T2, M, nTile>(l0a[l0a_base], l0b[l0b_base],
+                                              C[cNOffset], initflag, kSize,
+                                              transpose_B ? n_actual : nTile);
+            SetFlag<HardEvent::M_MTE1>(L0AB_EVENT + pp);
+            tileIdx++;
+          }
+        }
+        WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT);
+        WaitFlag<HardEvent::M_MTE1>(L0AB_EVENT + 1);
+
+        SetFlag<HardEvent::MTE1_MTE2>(L0AB_EVENT);
+        WaitFlag<HardEvent::MTE1_MTE2>(L0AB_EVENT);
+        SetFlag<HardEvent::M_FIX>(L0AB_EVENT);
+        WaitFlag<HardEvent::M_FIX>(L0AB_EVENT);
+      }
+
+      // 2-way merge sort
+      template <typename T>
+      CATLASS_DEVICE void MergeSort(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
           const LocalTensor<T> &src1, uint32_t blockLen0, uint32_t blockLen1) {
-  AscendC::MrgSort4Info params;
-  params.elementLengths[0] = blockLen0;
-  params.elementLengths[1] = blockLen1;
-  params.elementLengths[2] = 0;
-  params.elementLengths[3] = 0;
-  params.ifExhaustedSuspension = false;
-  params.validBit = 3;
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = blockLen0;
+        params.elementLengths[1] = blockLen1;
+        params.elementLengths[2] = 0;
+        params.elementLengths[3] = 0;
+        params.ifExhaustedSuspension = false;
+        params.validBit = 3;
 
-  AscendC::MrgSortSrcList<T> srcList;
-  srcList.src1 = src0;
-  srcList.src2 = src1;
-  srcList.src3 = src0;
-  srcList.src4 = src0;
+        AscendC::MrgSortSrcList<T> srcList;
+        srcList.src1 = src0;
+        srcList.src2 = src1;
+        srcList.src3 = src0;
+        srcList.src4 = src0;
 
-  AscendC::MrgSort<T>(dst, srcList, params);
-  PipeBarrier<PIPE_V>();
-}
+        AscendC::MrgSort<T>(dst, srcList, params);
+        PipeBarrier<PIPE_V>();
+      }
 
-// 3-way merge sort
-template <typename T>
-CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+      // 3-way merge sort
+      template <typename T>
+      CATLASS_DEVICE void MergeSort(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
           const LocalTensor<T> &src1, const LocalTensor<T> &src2,
           uint32_t blockLen0, uint32_t blockLen1, uint32_t blockLen2) {
-  AscendC::MrgSort4Info params;
-  params.elementLengths[0] = blockLen0;
-  params.elementLengths[1] = blockLen1;
-  params.elementLengths[2] = blockLen2;
-  params.elementLengths[3] = 0;
-  params.ifExhaustedSuspension = false;
-  params.validBit = 7;
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = blockLen0;
+        params.elementLengths[1] = blockLen1;
+        params.elementLengths[2] = blockLen2;
+        params.elementLengths[3] = 0;
+        params.ifExhaustedSuspension = false;
+        params.validBit = 7;
 
-  AscendC::MrgSortSrcList<T> srcList;
-  srcList.src1 = src0;
-  srcList.src2 = src1;
-  srcList.src3 = src2;
-  srcList.src4 = src0;
+        AscendC::MrgSortSrcList<T> srcList;
+        srcList.src1 = src0;
+        srcList.src2 = src1;
+        srcList.src3 = src2;
+        srcList.src4 = src0;
 
-  AscendC::MrgSort<T>(dst, srcList, params);
-  PipeBarrier<PIPE_V>();
-}
+        AscendC::MrgSort<T>(dst, srcList, params);
+        PipeBarrier<PIPE_V>();
+      }
 
-// 4-way merge sort
-template <typename T>
-CATLASS_DEVICE void
-MergeSort(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+      // 4-way merge sort
+      template <typename T>
+      CATLASS_DEVICE void MergeSort(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
           const LocalTensor<T> &src1, const LocalTensor<T> &src2,
           const LocalTensor<T> &src3, uint32_t blockLen0, uint32_t blockLen1,
           uint32_t blockLen2, uint32_t blockLen3) {
-  AscendC::MrgSort4Info params;
-  params.elementLengths[0] = blockLen0;
-  params.elementLengths[1] = blockLen1;
-  params.elementLengths[2] = blockLen2;
-  params.elementLengths[3] = blockLen3;
-  params.ifExhaustedSuspension = false;
-  params.validBit = 15;
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = blockLen0;
+        params.elementLengths[1] = blockLen1;
+        params.elementLengths[2] = blockLen2;
+        params.elementLengths[3] = blockLen3;
+        params.ifExhaustedSuspension = false;
+        params.validBit = 15;
 
-  AscendC::MrgSortSrcList<T> srcList;
-  srcList.src1 = src0;
-  srcList.src2 = src1;
-  srcList.src3 = src2;
-  srcList.src4 = src3;
+        AscendC::MrgSortSrcList<T> srcList;
+        srcList.src1 = src0;
+        srcList.src2 = src1;
+        srcList.src3 = src2;
+        srcList.src4 = src3;
 
-  AscendC::MrgSort<T>(dst, srcList, params);
-  PipeBarrier<PIPE_V>();
-}
+        AscendC::MrgSort<T>(dst, srcList, params);
+        PipeBarrier<PIPE_V>();
+      }
 
-template <typename T>
-CATLASS_DEVICE void GatherMask(const LocalTensor<T> &dst,
-                               const LocalTensor<T> &sortedTensor,
-                               uint8_t src1Pattern) {
-  uint32_t eleNum = sortedTensor.GetSize();
-  GatherMaskParams gatherMaskParams;
-  gatherMaskParams.repeatTimes = Ceil(eleNum * sizeof(T), 256);
-  gatherMaskParams.src0BlockStride = 1;
-  gatherMaskParams.src0RepeatStride = 8;
-  gatherMaskParams.src1RepeatStride = 0;
-  uint64_t rsvdCnt = 0; // 用于保存筛选后保留下来的元素个数
-  GatherMask(dst, sortedTensor, src1Pattern, false, static_cast<uint32_t>(0),
-             gatherMaskParams, rsvdCnt);
-  PipeBarrier<PIPE_V>();
-}
+      template <typename T>
+      CATLASS_DEVICE void GatherMask(const LocalTensor<T> &dst,
+                                     const LocalTensor<T> &sortedTensor,
+                                     uint8_t src1Pattern) {
+        uint32_t eleNum = sortedTensor.GetSize();
+        GatherMaskParams gatherMaskParams;
+        gatherMaskParams.repeatTimes = Ceil(eleNum * sizeof(T), 256);
+        gatherMaskParams.src0BlockStride = 1;
+        gatherMaskParams.src0RepeatStride = 8;
+        gatherMaskParams.src1RepeatStride = 0;
+        uint64_t rsvdCnt = 0; // 用于保存筛选后保留下来的元素个数
+        GatherMask(dst, sortedTensor, src1Pattern, false,
+                   static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
+        PipeBarrier<PIPE_V>();
+      }
 
-template <typename T, typename U>
-CATLASS_DEVICE void GatherMask(const LocalTensor<T> &dst,
-                               const LocalTensor<T> &sortedTensor,
-                               const LocalTensor<U> &src1Pattern) {
-  uint32_t eleNum = sortedTensor.GetSize();
-  GatherMaskParams gatherMaskParams;
-  gatherMaskParams.repeatTimes = Ceil(eleNum * sizeof(T), 256);
-  gatherMaskParams.src0BlockStride = 1;
-  gatherMaskParams.src0RepeatStride = 8;
-  gatherMaskParams.src1RepeatStride = 0;
-  uint64_t rsvdCnt = 0; // 用于保存筛选后保留下来的元素个数
-  GatherMask(dst, sortedTensor, src1Pattern, false, static_cast<uint32_t>(0),
-             gatherMaskParams, rsvdCnt);
-}
+      template <typename T, typename U>
+      CATLASS_DEVICE void GatherMask(const LocalTensor<T> &dst,
+                                     const LocalTensor<T> &sortedTensor,
+                                     const LocalTensor<U> &src1Pattern) {
+        uint32_t eleNum = sortedTensor.GetSize();
+        GatherMaskParams gatherMaskParams;
+        gatherMaskParams.repeatTimes = Ceil(eleNum * sizeof(T), 256);
+        gatherMaskParams.src0BlockStride = 1;
+        gatherMaskParams.src0RepeatStride = 8;
+        gatherMaskParams.src1RepeatStride = 0;
+        uint64_t rsvdCnt = 0; // 用于保存筛选后保留下来的元素个数
+        GatherMask(dst, sortedTensor, src1Pattern, false,
+                   static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
+      }
 
-template <typename T>
-CATLASS_DEVICE void Gather(const LocalTensor<T> &dst,
-                           const LocalTensor<T> &sortedTensor,
-                           const LocalTensor<uint32_t> &src1Pattern) {
+      template <typename T>
+      CATLASS_DEVICE void Gather(const LocalTensor<T> &dst,
+                                 const LocalTensor<T> &sortedTensor,
+                                 const LocalTensor<uint32_t> &src1Pattern) {
 
-  int32_t count = src1Pattern.GetSize();
-  int32_t scalarValue = sizeof(T);
-  LocalTensor<int32_t> offset = const_cast<LocalTensor<uint32_t> &>(src1Pattern)
-                                    .template ReinterpretCast<int32_t>();
-  AscendC::Muls(offset, offset, scalarValue, count);
-  AscendC::Gather(dst, sortedTensor,
-                  offset.template ReinterpretCast<uint32_t>(),
-                  static_cast<uint32_t>(0), static_cast<uint32_t>(count));
-}
+        int32_t count = src1Pattern.GetSize();
+        int32_t scalarValue = sizeof(T);
+        LocalTensor<int32_t> offset =
+            const_cast<LocalTensor<uint32_t> &>(src1Pattern)
+                .template ReinterpretCast<int32_t>();
+        AscendC::Muls(offset, offset, scalarValue, count);
+        AscendC::Gather(dst, sortedTensor,
+                        offset.template ReinterpretCast<uint32_t>(),
+                        static_cast<uint32_t>(0), static_cast<uint32_t>(count));
+      }
 
-template <typename T>
-CATLASS_DEVICE void
-Gatherb(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-        const LocalTensor<uint32_t> &offset, uint8_t repeat_time,
-        uint8_t dst_blk_stride, uint8_t dst_rep_stride) {
-  GatherRepeatParams gatherRepeatParams;
-  gatherRepeatParams.dstBlkStride = dst_blk_stride;
-  gatherRepeatParams.dstRepStride = dst_rep_stride;
-  Gatherb(dst.template ReinterpretCast<uint32_t>(),
-          src0.template ReinterpretCast<uint32_t>(),
-          offset.template ReinterpretCast<uint32_t>(), repeat_time,
-          gatherRepeatParams);
-  PipeBarrier<PIPE_V>();
-}
+      template <typename T>
+      CATLASS_DEVICE void Gatherb(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const LocalTensor<uint32_t> &offset, uint8_t repeat_time,
+          uint8_t dst_blk_stride, uint8_t dst_rep_stride) {
+        GatherRepeatParams gatherRepeatParams;
+        gatherRepeatParams.dstBlkStride = dst_blk_stride;
+        gatherRepeatParams.dstRepStride = dst_rep_stride;
+        Gatherb(dst.template ReinterpretCast<uint32_t>(),
+                src0.template ReinterpretCast<uint32_t>(),
+                offset.template ReinterpretCast<uint32_t>(), repeat_time,
+                gatherRepeatParams);
+        PipeBarrier<PIPE_V>();
+      }
 
-template <typename T>
-CATLASS_DEVICE void InitSortBuf(const LocalTensor<T> &src, int64_t eleNum,
-                                int64_t rsv = 0) {
-  constexpr int32_t NEG_INF = 0xFF800000;
-  constexpr uint8_t VEC_REPEAT_MAX = 255;
-  constexpr uint8_t B32_VEC_ELM_NUM = 64;
-  uint64_t mask1[2] = {0x5555555555555555, 0};
-  uint64_t mask0[2] = {0xaaaaaaaaaaaaaaaa, 0};
-  int64_t repeatNum = eleNum / B32_VEC_ELM_NUM;
-  int64_t forLoop = repeatNum / VEC_REPEAT_MAX;
-  int64_t forRemain = repeatNum % VEC_REPEAT_MAX;
-  for (int i = 0; i < forLoop; i++) {
-    Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1,
-              VEC_REPEAT_MAX, 1, 8);
-    Duplicate(src.template ReinterpretCast<int32_t>(), -1, mask0,
-              VEC_REPEAT_MAX, 1, 8);
-  }
-  if (forRemain > 0) {
-    Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX *
+      template <typename T>
+      CATLASS_DEVICE void InitSortBuf(const LocalTensor<T> &src, int64_t eleNum,
+                                      int64_t rsv = 0) {
+        constexpr int32_t NEG_INF = 0xFF800000;
+        constexpr uint8_t VEC_REPEAT_MAX = 255;
+        constexpr uint8_t B32_VEC_ELM_NUM = 64;
+        uint64_t mask1[2] = {0x5555555555555555, 0};
+        uint64_t mask0[2] = {0xaaaaaaaaaaaaaaaa, 0};
+        int64_t repeatNum = eleNum / B32_VEC_ELM_NUM;
+        int64_t forLoop = repeatNum / VEC_REPEAT_MAX;
+        int64_t forRemain = repeatNum % VEC_REPEAT_MAX;
+        for (int i = 0; i < forLoop; i++) {
+          Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1,
+                    VEC_REPEAT_MAX, 1, 8);
+          Duplicate(src.template ReinterpretCast<int32_t>(), -1, mask0,
+                    VEC_REPEAT_MAX, 1, 8);
+        }
+        if (forRemain > 0) {
+          Duplicate(
+              src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX *
                                                       B32_VEC_ELM_NUM],
               NEG_INF, mask1, forRemain, 1, 8);
-    Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX *
+          Duplicate(
+              src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX *
                                                       B32_VEC_ELM_NUM],
               -1, mask0, forRemain, 1, 8);
-  }
-  PipeBarrier<PIPE_V>();
-}
+        }
+        PipeBarrier<PIPE_V>();
+      }
 
-template <typename T>
-CATLASS_DEVICE void brcb(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-                         const uint8_t repeatTime, const uint16_t dstBlkStride,
-                         const uint16_t dstRepStride) {
-  AscendC::BrcbRepeatParams repeatParams(dstBlkStride, dstRepStride);
-  AscendC::Brcb<T>(dst, src0, repeatTime, repeatParams);
-}
+      template <typename T>
+      CATLASS_DEVICE void brcb(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const uint8_t repeatTime, const uint16_t dstBlkStride,
+          const uint16_t dstRepStride) {
+        AscendC::BrcbRepeatParams repeatParams(dstBlkStride, dstRepStride);
+        AscendC::Brcb<T>(dst, src0, repeatTime, repeatParams);
+      }
 
-template <typename T>
-CATLASS_DEVICE void
-mul_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-         const LocalTensor<T> &src1, const uint64_t mask0, const uint64_t mask1,
-         const uint8_t repeatTime, const uint8_t dstBlkStride,
-         const uint8_t src0BlkStride, const uint8_t src1BlkStride,
-         const uint8_t dstRepStride, const uint8_t src0RepStride,
-         const uint8_t src1RepStride) {
-  uint64_t mask[2] = {mask0, mask1};
-  AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride, src1BlkStride,
-                                     dstRepStride, src0RepStride,
-                                     src1RepStride);
-  AscendC::Mul<T, false>(dst, src0, src1, mask, repeatTime, params);
-}
+      template <typename T>
+      CATLASS_DEVICE void mul_mask(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const LocalTensor<T> &src1, const uint64_t mask0,
+          const uint64_t mask1, const uint8_t repeatTime,
+          const uint8_t dstBlkStride, const uint8_t src0BlkStride,
+          const uint8_t src1BlkStride, const uint8_t dstRepStride,
+          const uint8_t src0RepStride, const uint8_t src1RepStride) {
+        uint64_t mask[2] = {mask0, mask1};
+        AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride,
+                                           src1BlkStride, dstRepStride,
+                                           src0RepStride, src1RepStride);
+        AscendC::Mul<T, false>(dst, src0, src1, mask, repeatTime, params);
+      }
 
-template <typename T>
-CATLASS_DEVICE void
-sub_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-         const LocalTensor<T> &src1, const uint64_t mask0, const uint64_t mask1,
-         const uint8_t repeatTime, const uint8_t dstBlkStride,
-         const uint8_t src0BlkStride, const uint8_t src1BlkStride,
-         const uint8_t dstRepStride, const uint8_t src0RepStride,
-         const uint8_t src1RepStride) {
-  uint64_t mask[2] = {mask0, mask1};
-  AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride, src1BlkStride,
-                                     dstRepStride, src0RepStride,
-                                     src1RepStride);
-  AscendC::Sub<T, false>(dst, src0, src1, mask, repeatTime, params);
-}
+      template <typename T>
+      CATLASS_DEVICE void sub_mask(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const LocalTensor<T> &src1, const uint64_t mask0,
+          const uint64_t mask1, const uint8_t repeatTime,
+          const uint8_t dstBlkStride, const uint8_t src0BlkStride,
+          const uint8_t src1BlkStride, const uint8_t dstRepStride,
+          const uint8_t src0RepStride, const uint8_t src1RepStride) {
+        uint64_t mask[2] = {mask0, mask1};
+        AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride,
+                                           src1BlkStride, dstRepStride,
+                                           src0RepStride, src1RepStride);
+        AscendC::Sub<T, false>(dst, src0, src1, mask, repeatTime, params);
+      }
 
-template <typename T>
-CATLASS_DEVICE void
-div_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-         const LocalTensor<T> &src1, const uint64_t mask0, const uint64_t mask1,
-         const uint8_t repeatTime, const uint8_t dstBlkStride,
-         const uint8_t src0BlkStride, const uint8_t src1BlkStride,
-         const uint8_t dstRepStride, const uint8_t src0RepStride,
-         const uint8_t src1RepStride) {
-  uint64_t mask[2] = {mask0, mask1};
-  AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride, src1BlkStride,
-                                     dstRepStride, src0RepStride,
-                                     src1RepStride);
-  AscendC::Div<T, false>(dst, src0, src1, mask, repeatTime, params);
-}
+      template <typename T>
+      CATLASS_DEVICE void div_mask(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const LocalTensor<T> &src1, const uint64_t mask0,
+          const uint64_t mask1, const uint8_t repeatTime,
+          const uint8_t dstBlkStride, const uint8_t src0BlkStride,
+          const uint8_t src1BlkStride, const uint8_t dstRepStride,
+          const uint8_t src0RepStride, const uint8_t src1RepStride) {
+        uint64_t mask[2] = {mask0, mask1};
+        AscendC::BinaryRepeatParams params(dstBlkStride, src0BlkStride,
+                                           src1BlkStride, dstRepStride,
+                                           src0RepStride, src1RepStride);
+        AscendC::Div<T, false>(dst, src0, src1, mask, repeatTime, params);
+      }
 
-// Strided masked exp for the narrow online-softmax window: exp only the `mask`
-// valid columns of each row, striding `srcRepStride`/`dstRepStride` 32B-blocks
-// between rows so one call touches just the [0:tw] window of a wider,
-// physically-strided score buffer (no compaction). Unary mirror of sub_mask;
-// ExpExperimentCodegen derives repeatTime/rep_stride from the buffer's physical
-// column count, and callers loop 64-column (fp32) chunks over the valid window.
-template <typename T>
-CATLASS_DEVICE void
-exp_mask(const LocalTensor<T> &dst, const LocalTensor<T> &src,
-         const uint64_t mask0, const uint64_t mask1, const uint8_t repeatTime,
-         const uint8_t dstBlkStride, const uint8_t srcBlkStride,
-         const uint8_t dstRepStride, const uint8_t srcRepStride) {
-  uint64_t mask[2] = {mask0, mask1};
-  AscendC::UnaryRepeatParams params(dstBlkStride, srcBlkStride, dstRepStride,
-                                    srcRepStride);
-  AscendC::Exp<T, false>(dst, src, mask, repeatTime, params);
-}
+      // Strided masked exp for the narrow online-softmax window: exp only the
+      // `mask` valid columns of each row, striding
+      // `srcRepStride`/`dstRepStride` 32B-blocks between rows so one call
+      // touches just the [0:tw] window of a wider, physically-strided score
+      // buffer (no compaction). Unary mirror of sub_mask; ExpExperimentCodegen
+      // derives repeatTime/rep_stride from the buffer's physical column count,
+      // and callers loop 64-column (fp32) chunks over the valid window.
+      template <typename T>
+      CATLASS_DEVICE void exp_mask(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
+          const uint64_t mask0, const uint64_t mask1, const uint8_t repeatTime,
+          const uint8_t dstBlkStride, const uint8_t srcBlkStride,
+          const uint8_t dstRepStride, const uint8_t srcRepStride) {
+        uint64_t mask[2] = {mask0, mask1};
+        AscendC::UnaryRepeatParams params(dstBlkStride, srcBlkStride,
+                                          dstRepStride, srcRepStride);
+        AscendC::Exp<T, false>(dst, src, mask, repeatTime, params);
+      }
 
-template <typename T1, typename T2, typename LayOutL1, typename LayoutGM,
-          uint32_t M, uint32_t N, uint32_t K, uint32_t baseM, uint32_t baseN,
-          uint32_t baseK, bool init, bool is_transpose_A = false,
-          bool is_transpose_B = false, bool enable_relu = false>
-CATLASS_DEVICE void gemmL1(LocalTensor<T1> A, LocalTensor<T1> B,
-                           GlobalTensor<T1> C, LocalTensor<T1> A2,
-                           LocalTensor<T1> B2, LocalTensor<T2> C2) {
-  for (uint32_t loopM = 0; loopM < M / baseM; loopM++) {
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+      template <typename T1, typename T2, typename LayOutL1, typename LayoutGM,
+                uint32_t M, uint32_t N, uint32_t K, uint32_t baseM,
+                uint32_t baseN, uint32_t baseK, bool init,
+                bool is_transpose_A = false, bool is_transpose_B = false,
+                bool enable_relu = false>
+      CATLASS_DEVICE void gemmL1(LocalTensor<T1> A, LocalTensor<T1> B,
+                                 GlobalTensor<T1> C, LocalTensor<T1> A2,
+                                 LocalTensor<T1> B2, LocalTensor<T2> C2) {
+        for (uint32_t loopM = 0; loopM < M / baseM; loopM++) {
+          AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+          AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(0);
 
-    copy_l1_to_l0a<T1, M, K, baseM, baseK>(A2, A[loopM * baseM * 16]);
+          copy_l1_to_l0a<T1, M, K, baseM, baseK>(A2, A[loopM * baseM * 16]);
 
-    for (uint32_t loopN = 0; loopN < N / baseN; loopN++) {
-      copy_l1_to_l0b<T1, K, N, baseK, baseN>(B2, B[loopN * baseN * K]);
+          for (uint32_t loopN = 0; loopN < N / baseN; loopN++) {
+            copy_l1_to_l0b<T1, K, N, baseK, baseN>(B2, B[loopN * baseN * K]);
 
-      AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(0);
-      AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(0);
 
-      mma<T1, T2, baseM, baseN, baseK, init>(A2, B2, C2);
+            mma<T1, T2, baseM, baseN, baseK, init>(A2, B2, C2);
 
-      AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
-      AscendC::SetFlag<AscendC::HardEvent::M_MTE2>(0);
-      AscendC::SetFlag<AscendC::HardEvent::M_FIX>(0);
-      AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(0);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(0);
+            AscendC::SetFlag<AscendC::HardEvent::M_MTE2>(0);
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(0);
 
-      copy_l0c_to_gm<T1, T2, LayoutGM, baseM, baseN, M, N>(
-          C[loopM * baseM * N + loopN * baseN], C2, enable_relu);
+            copy_l0c_to_gm<T1, T2, LayoutGM, baseM, baseN, M, N>(
+                C[loopM * baseM * N + loopN * baseN], C2, enable_relu);
 
-      AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
-      AscendC::WaitFlag<AscendC::HardEvent::M_MTE2>(0);
-    }
-    AscendC::PipeBarrier<PIPE_ALL>();
-  }
-}
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::M_MTE2>(0);
+          }
+          AscendC::PipeBarrier<PIPE_ALL>();
+        }
+      }
 
-template <typename T, int32_t dim, int32_t axis, bool isReuseSource = false>
-CATLASS_DEVICE void
-Broadcast(const LocalTensor<T> &dst, const LocalTensor<T> &src,
+      template <typename T, int32_t dim, int32_t axis,
+                bool isReuseSource = false>
+      CATLASS_DEVICE void Broadcast(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
           LocalTensor<uint8_t> sharedTmpBuffer, const uint32_t dstShape[dim],
           const uint32_t srcShape[dim]) {
-  AscendC::Broadcast<T, dim, axis, isReuseSource>(dst, src, dstShape, srcShape,
-                                                  sharedTmpBuffer);
-}
+        AscendC::Broadcast<T, dim, axis, isReuseSource>(
+            dst, src, dstShape, srcShape, sharedTmpBuffer);
+      }
 
-template <typename T, int32_t dim, int32_t axis, bool isReuseSource = false>
-CATLASS_DEVICE void
-Broadcast(const LocalTensor<T> &dst, const LocalTensor<T> &src,
+      template <typename T, int32_t dim, int32_t axis,
+                bool isReuseSource = false>
+      CATLASS_DEVICE void Broadcast(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
           const uint32_t dstShape[dim], const uint32_t srcShape[dim]) {
-  uint32_t dstSize = 1;
-  uint32_t srcSize = 1;
-  for (int32_t i = 0; i < dim; ++i) {
-    dstSize *= dstShape[i];
-    srcSize *= srcShape[i];
-  }
-  if (srcSize == dstSize) {
-    AscendC::Muls(dst, src, static_cast<T>(1), dstSize);
-    return;
-  }
-  ASCENDC_ASSERT((srcSize == 1), {
-    KERNEL_LOG(KERNEL_ERROR,
-               "Workspace-free Broadcast only supports equal or scalar shapes");
-  });
-  AscendC::Duplicate(dst, src.GetValue(0), dstSize);
-}
-
-template <typename T>
-CATLASS_DEVICE void Fill(const LocalTensor<T> &dst, const T &scalarValue,
-                         const int32_t &count) {
-  AscendC::Duplicate<T>(dst, scalarValue, count);
-}
-
-template <typename T>
-CATLASS_DEVICE void ArithProgression(const LocalTensor<T> &dst,
-                                     const T firstValue, const T diffValue,
-                                     const int32_t count) {
-  AscendC::ArithProgression<T>(dst, firstValue, diffValue, count);
-}
-
-template <typename T>
-CATLASS_DEVICE void Sort(const LocalTensor<T> &dst, const LocalTensor<T> &src,
-                         const LocalTensor<T> &tmp, const int32_t repeatTimes,
-                         const int32_t actualCount) {
-  if constexpr (sizeof(T) == 2) {
-    // B16 (half): MrgSort requires >= 256 bytes per source, but Sort32 only
-    // produces 128 bytes per block for B16. Work around by sorting in float.
-    //
-    // Layout in tmp (N = alignedCount, as float elements via ReinterpretCast):
-    //   ftmp[0 .. N*2-1]    = Sort32 output + merge ping-pong buffer A
-    //   ftmp[N*2 .. N*4-1]  = Sort<float>'s dst (merge ping-pong buffer B)
-    //     - before Sort32: indices at [N*2..N*3), float_src at [N*3..N*4)
-    //     - after  Sort32: entire region free for merge
-    // Total: 4N float elements = 8N half elements.
-    uint32_t N = repeatTimes * 32;
-
-    auto ftmp = tmp.template ReinterpretCast<float>();
-    auto float_src = ftmp[N * 3];
-
-    // Cast half → float
-    AscendC::Cast(float_src, src, AscendC::RoundMode::CAST_NONE, N);
-
-    // Sort<float> guarantees result in dst (= ftmp[N*2])
-    Sort<float>(ftmp[N * 2], float_src, ftmp, repeatTimes, actualCount);
-
-    // Cast float result → half (2*N elements: interleaved [value, index] pairs)
-    AscendC::Cast(dst, ftmp[N * 2], AscendC::RoundMode::CAST_RINT, N * 2);
-    PipeBarrier<PIPE_V>();
-    return;
-  }
-
-  constexpr uint32_t blockSize = 32;
-  uint32_t alignedCount = repeatTimes * blockSize;
-  uint32_t padCount = alignedCount - actualCount;
-  uint32_t blockNum = repeatTimes;
-
-  // Generate ascending indices as float values (0.0, 1.0, 2.0, ...) in dst
-  // (temporary storage — overwritten by merge later). This allows tmp to
-  // be only alignedCount*2 elements instead of alignedCount*4, because dst
-  // (which is 2*alignedCount for interleaved output) doubles as the second
-  // merge ping-pong buffer.
-  AscendC::ArithProgression<T>(dst, T(0), T(1), alignedCount);
-  PipeBarrier<PIPE_V>();
-  LocalTensor<uint32_t> indices = dst.template ReinterpretCast<uint32_t>();
-
-  // Pad src in-place with -inf for unused positions
-  if (padCount > 0) {
-    T negInf = -CUDART_INF_F;
-    constexpr uint32_t elemPerBlock =
-        32 / sizeof(T); // 16 for half, 8 for float
-    uint32_t alignedActual = (actualCount / elemPerBlock) * elemPerBlock;
-    uint32_t inBlockOffset = actualCount - alignedActual;
-
-    if (inBlockOffset == 0) {
-      // actualCount is already 32-byte aligned, simple Duplicate
-      AscendC::Duplicate<T>(src[actualCount], negInf, padCount);
-    } else {
-      // Non-aligned: split into aligned bulk fill + masked partial block
-      uint32_t nextAligned = alignedActual + elemPerBlock;
-      // Fill full aligned blocks after the partial one
-      if (nextAligned < alignedCount) {
-        AscendC::Duplicate<T>(src[nextAligned], negInf,
-                              alignedCount - nextAligned);
+        uint32_t dstSize = 1;
+        uint32_t srcSize = 1;
+        for (int32_t i = 0; i < dim; ++i) {
+          dstSize *= dstShape[i];
+          srcSize *= srcShape[i];
+        }
+        if (srcSize == dstSize) {
+          AscendC::Muls(dst, src, static_cast<T>(1), dstSize);
+          return;
+        }
+        ASCENDC_ASSERT((srcSize == 1), {
+          KERNEL_LOG(
+              KERNEL_ERROR,
+              "Workspace-free Broadcast only supports equal or scalar shapes");
+        });
+        AscendC::Duplicate(dst, src.GetValue(0), dstSize);
       }
-      // Fill partial block using mask to preserve valid elements before
-      // actualCount
-      uint64_t mask0 = 0;
-      for (uint32_t i = inBlockOffset; i < elemPerBlock; i++) {
-        mask0 |= (1ULL << i);
+
+      template <typename T>
+      CATLASS_DEVICE void Fill(const LocalTensor<T> &dst, const T &scalarValue,
+                               const int32_t &count) {
+        AscendC::Duplicate<T>(dst, scalarValue, count);
       }
-      uint64_t masks[2] = {mask0, 0};
-      AscendC::Duplicate(src[alignedActual], negInf, masks, (uint8_t)1,
-                         (uint16_t)1, (uint8_t)0);
-    }
-    PipeBarrier<PIPE_V>();
-  }
 
-  // Sort32: each 32-element block → tmp[0..alignedCount*2-1] (bufA)
-  AscendC::Sort32(tmp, src, indices, repeatTimes);
-  PipeBarrier<PIPE_V>();
+      template <typename T>
+      CATLASS_DEVICE void ArithProgression(
+          const LocalTensor<T> &dst, const T firstValue, const T diffValue,
+          const int32_t count) {
+        AscendC::ArithProgression<T>(dst, firstValue, diffValue, count);
+      }
 
-  // Merge ping-pong between tmp[0..2N-1] and dst[0..2N-1].
-  // tmp only needs alignedCount*2 elements (Sort32 output size).
+      template <typename T>
+      CATLASS_DEVICE void Sort(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
+          const LocalTensor<T> &tmp, const int32_t repeatTimes,
+          const int32_t actualCount) {
+        if constexpr (sizeof(T) == 2) {
+          // B16 (half): MrgSort requires >= 256 bytes per source, but Sort32
+          // only produces 128 bytes per block for B16. Work around by sorting
+          // in float.
+          //
+          // Layout in tmp (N = alignedCount, as float elements via
+          // ReinterpretCast):
+          //   ftmp[0 .. N*2-1]    = Sort32 output + merge ping-pong buffer A
+          //   ftmp[N*2 .. N*4-1]  = Sort<float>'s dst (merge ping-pong buffer
+          //   B)
+          //     - before Sort32: indices at [N*2..N*3), float_src at [N*3..N*4)
+          //     - after  Sort32: entire region free for merge
+          // Total: 4N float elements = 8N half elements.
+          uint32_t N = repeatTimes * 32;
 
-  if (blockNum > 1) {
-    uint32_t fullSegSize = blockSize;
-    uint32_t lastSegSize = blockSize;
-    uint32_t numSegs = blockNum;
-    bool readFromTmp = true; // Sort32 output is in tmp
+          auto ftmp = tmp.template ReinterpretCast<float>();
+          auto float_src = ftmp[N * 3];
 
-    while (numSegs > 1) {
-      uint32_t newNumSegs = 0;
-      uint32_t inOffset = 0;
-      uint32_t outOffset = 0;
+          // Cast half → float
+          AscendC::Cast(float_src, src, AscendC::RoundMode::CAST_NONE, N);
 
-      for (uint32_t g = 0; g < numSegs; g += 4) {
-        uint32_t groupCount = numSegs - g;
-        if (groupCount > 4) {
-          groupCount = 4;
-        }
-        uint32_t len0 = (g == numSegs - 1) ? lastSegSize : fullSegSize;
-        uint32_t len1 = 0, len2 = 0, len3 = 0;
-        uint32_t totalElems = len0;
-        if (groupCount > 1) {
-          len1 = (g + 1 == numSegs - 1) ? lastSegSize : fullSegSize;
-          totalElems += len1;
-        }
-        if (groupCount > 2) {
-          len2 = (g + 2 == numSegs - 1) ? lastSegSize : fullSegSize;
-          totalElems += len2;
-        }
-        if (groupCount > 3) {
-          len3 = (g + 3 == numSegs - 1) ? lastSegSize : fullSegSize;
-          totalElems += len3;
+          // Sort<float> guarantees result in dst (= ftmp[N*2])
+          Sort<float>(ftmp[N * 2], float_src, ftmp, repeatTimes, actualCount);
+
+          // Cast float result → half (2*N elements: interleaved [value, index]
+          // pairs)
+          AscendC::Cast(dst, ftmp[N * 2], AscendC::RoundMode::CAST_RINT, N * 2);
+          PipeBarrier<PIPE_V>();
+          return;
         }
 
-        if (groupCount == 1) {
-          if (readFromTmp) {
-            AscendC::DataCopy(dst[outOffset], tmp[inOffset], len0 * 2);
+        constexpr uint32_t blockSize = 32;
+        uint32_t alignedCount = repeatTimes * blockSize;
+        uint32_t padCount = alignedCount - actualCount;
+        uint32_t blockNum = repeatTimes;
+
+        // Generate ascending indices as float values (0.0, 1.0, 2.0, ...) in
+        // dst (temporary storage — overwritten by merge later). This allows tmp
+        // to be only alignedCount*2 elements instead of alignedCount*4, because
+        // dst (which is 2*alignedCount for interleaved output) doubles as the
+        // second merge ping-pong buffer.
+        AscendC::ArithProgression<T>(dst, T(0), T(1), alignedCount);
+        PipeBarrier<PIPE_V>();
+        LocalTensor<uint32_t> indices =
+            dst.template ReinterpretCast<uint32_t>();
+
+        // Pad src in-place with -inf for unused positions
+        if (padCount > 0) {
+          T negInf = -CUDART_INF_F;
+          constexpr uint32_t elemPerBlock =
+              32 / sizeof(T); // 16 for half, 8 for float
+          uint32_t alignedActual = (actualCount / elemPerBlock) * elemPerBlock;
+          uint32_t inBlockOffset = actualCount - alignedActual;
+
+          if (inBlockOffset == 0) {
+            // actualCount is already 32-byte aligned, simple Duplicate
+            AscendC::Duplicate<T>(src[actualCount], negInf, padCount);
           } else {
-            AscendC::DataCopy(tmp[outOffset], dst[inOffset], len0 * 2);
+            // Non-aligned: split into aligned bulk fill + masked partial block
+            uint32_t nextAligned = alignedActual + elemPerBlock;
+            // Fill full aligned blocks after the partial one
+            if (nextAligned < alignedCount) {
+              AscendC::Duplicate<T>(src[nextAligned], negInf,
+                                    alignedCount - nextAligned);
+            }
+            // Fill partial block using mask to preserve valid elements before
+            // actualCount
+            uint64_t mask0 = 0;
+            for (uint32_t i = inBlockOffset; i < elemPerBlock; i++) {
+              mask0 |= (1ULL << i);
+            }
+            uint64_t masks[2] = {mask0, 0};
+            AscendC::Duplicate(src[alignedActual], negInf, masks, (uint8_t)1,
+                               (uint16_t)1, (uint8_t)0);
+          }
+          PipeBarrier<PIPE_V>();
+        }
+
+        // Sort32: each 32-element block → tmp[0..alignedCount*2-1] (bufA)
+        AscendC::Sort32(tmp, src, indices, repeatTimes);
+        PipeBarrier<PIPE_V>();
+
+        // Merge ping-pong between tmp[0..2N-1] and dst[0..2N-1].
+        // tmp only needs alignedCount*2 elements (Sort32 output size).
+
+        if (blockNum > 1) {
+          uint32_t fullSegSize = blockSize;
+          uint32_t lastSegSize = blockSize;
+          uint32_t numSegs = blockNum;
+          bool readFromTmp = true; // Sort32 output is in tmp
+
+          while (numSegs > 1) {
+            uint32_t newNumSegs = 0;
+            uint32_t inOffset = 0;
+            uint32_t outOffset = 0;
+
+            for (uint32_t g = 0; g < numSegs; g += 4) {
+              uint32_t groupCount = numSegs - g;
+              if (groupCount > 4) {
+                groupCount = 4;
+              }
+              uint32_t len0 = (g == numSegs - 1) ? lastSegSize : fullSegSize;
+              uint32_t len1 = 0, len2 = 0, len3 = 0;
+              uint32_t totalElems = len0;
+              if (groupCount > 1) {
+                len1 = (g + 1 == numSegs - 1) ? lastSegSize : fullSegSize;
+                totalElems += len1;
+              }
+              if (groupCount > 2) {
+                len2 = (g + 2 == numSegs - 1) ? lastSegSize : fullSegSize;
+                totalElems += len2;
+              }
+              if (groupCount > 3) {
+                len3 = (g + 3 == numSegs - 1) ? lastSegSize : fullSegSize;
+                totalElems += len3;
+              }
+
+              if (groupCount == 1) {
+                if (readFromTmp) {
+                  AscendC::DataCopy(dst[outOffset], tmp[inOffset], len0 * 2);
+                } else {
+                  AscendC::DataCopy(tmp[outOffset], dst[inOffset], len0 * 2);
+                }
+              } else {
+                AscendC::MrgSort4Info params;
+                params.elementLengths[0] = len0;
+                params.elementLengths[1] = len1;
+                params.elementLengths[2] = groupCount > 2 ? len2 : 0;
+                params.elementLengths[3] = groupCount > 3 ? len3 : 0;
+                params.ifExhaustedSuspension = false;
+                params.validBit = (1 << groupCount) - 1;
+
+                uint32_t off0 = inOffset;
+                uint32_t off1 = off0 + len0 * 2;
+                uint32_t off2 = off1 + len1 * 2;
+                uint32_t off3 = off2 + len2 * 2;
+
+                AscendC::MrgSortSrcList<T> srcList;
+                if (readFromTmp) {
+                  srcList.src1 = tmp[off0];
+                  srcList.src2 = tmp[off1];
+                  srcList.src3 = groupCount > 2 ? tmp[off2] : tmp[off0];
+                  srcList.src4 = groupCount > 3 ? tmp[off3] : tmp[off0];
+                  AscendC::MrgSort<T>(dst[outOffset], srcList, params);
+                } else {
+                  srcList.src1 = dst[off0];
+                  srcList.src2 = dst[off1];
+                  srcList.src3 = groupCount > 2 ? dst[off2] : dst[off0];
+                  srcList.src4 = groupCount > 3 ? dst[off3] : dst[off0];
+                  AscendC::MrgSort<T>(tmp[outOffset], srcList, params);
+                }
+              }
+
+              inOffset += totalElems * 2;
+              outOffset += totalElems * 2;
+              newNumSegs++;
+            }
+
+            PipeBarrier<PIPE_V>();
+
+            uint32_t lastGroupStart = ((numSegs - 1) / 4) * 4;
+            uint32_t lastGroupCount = numSegs - lastGroupStart;
+            uint32_t newLastSegSize = 0;
+            for (uint32_t i = 0; i < lastGroupCount; i++) {
+              newLastSegSize += (lastGroupStart + i == numSegs - 1)
+                                    ? lastSegSize
+                                    : fullSegSize;
+            }
+
+            fullSegSize = (newNumSegs > 1) ? 4 * fullSegSize : newLastSegSize;
+            lastSegSize = newLastSegSize;
+            numSegs = newNumSegs;
+            readFromTmp = !readFromTmp;
+          }
+
+          // readFromTmp=true means last round wrote to tmp → result in tmp
+          if (readFromTmp) {
+            AscendC::DataCopy(dst, tmp, alignedCount * 2);
           }
         } else {
-          AscendC::MrgSort4Info params;
-          params.elementLengths[0] = len0;
-          params.elementLengths[1] = len1;
-          params.elementLengths[2] = groupCount > 2 ? len2 : 0;
-          params.elementLengths[3] = groupCount > 3 ? len3 : 0;
-          params.ifExhaustedSuspension = false;
-          params.validBit = (1 << groupCount) - 1;
+          // Single block: Sort32 output is in tmp, copy to dst
+          AscendC::DataCopy(dst, tmp, alignedCount * 2);
+        }
+      }
 
-          uint32_t off0 = inOffset;
-          uint32_t off1 = off0 + len0 * 2;
-          uint32_t off2 = off1 + len1 * 2;
-          uint32_t off3 = off2 + len2 * 2;
+      template <typename T>
+      CATLASS_DEVICE void ClampMax(const LocalTensor<T> &dst,
+                                   const LocalTensor<T> &buffer,
+                                   const LocalTensor<uint8_t> &tmp,
+                                   const T scalarValue, const int32_t count) {
+        AscendC::ClampMax<T>(dst, buffer, tmp, scalarValue, count);
+      }
 
-          AscendC::MrgSortSrcList<T> srcList;
-          if (readFromTmp) {
-            srcList.src1 = tmp[off0];
-            srcList.src2 = tmp[off1];
-            srcList.src3 = groupCount > 2 ? tmp[off2] : tmp[off0];
-            srcList.src4 = groupCount > 3 ? tmp[off3] : tmp[off0];
-            AscendC::MrgSort<T>(dst[outOffset], srcList, params);
-          } else {
-            srcList.src1 = dst[off0];
-            srcList.src2 = dst[off1];
-            srcList.src3 = groupCount > 2 ? dst[off2] : dst[off0];
-            srcList.src4 = groupCount > 3 ? dst[off3] : dst[off0];
-            AscendC::MrgSort<T>(tmp[outOffset], srcList, params);
+      template <typename T>
+      CATLASS_DEVICE void TopK(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
+          const LocalTensor<T> &tmp, const int32_t K, const int32_t repeatTimes,
+          const int32_t actualCount) {
+        // Use tmp as the full-size sort destination (2 * alignedCount
+        // elements). Sort writes its result into tmp's first region; we then
+        // copy the top-K portion into dst.
+        uint32_t alignedCount = repeatTimes * 32;
+        // sortDst needs 2 * alignedCount elements; reuse the tail of tmp.
+        // Layout of tmp: [0 .. 2*alignedCount-1] = sortDst, [2*alignedCount ..]
+        // = sortTmp
+        auto sortDst = tmp;
+        auto sortTmp = tmp[alignedCount * 2];
+        Sort<T>(sortDst, src, sortTmp, repeatTimes, actualCount);
+        PipeBarrier<PIPE_V>();
+        // Copy 2*K elements (interleaved value-index pairs) from sorted result
+        // to dst. DataCopy requires the byte count to be a multiple of 32
+        // bytes, so round up.
+        uint32_t topkElems = 2 * K;
+        constexpr uint32_t elemsPerBlock = 32 / sizeof(T);
+        uint32_t alignedTopk =
+            ((topkElems + elemsPerBlock - 1) / elemsPerBlock) * elemsPerBlock;
+        AscendC::DataCopy(dst, sortDst, alignedTopk);
+      }
+
+      template <typename T>
+      CATLASS_DEVICE void ClampMin(const LocalTensor<T> &dst,
+                                   const LocalTensor<T> &buffer,
+                                   const LocalTensor<uint8_t> &tmp,
+                                   const T scalarValue, const int32_t count) {
+        AscendC::ClampMin<T>(dst, buffer, tmp, scalarValue, count);
+      }
+
+      template <typename T>
+      CATLASS_DEVICE void Clamp(
+          const LocalTensor<T> &dst, const LocalTensor<T> &buffer,
+          const LocalTensor<uint8_t> &tmp, const T minScalarValue,
+          const T maxScalarValue, const int32_t count) {
+        AscendC::ClampMin<T>(dst, buffer, tmp, minScalarValue, count);
+        AscendC::ClampMax<T>(dst, dst, tmp, maxScalarValue, count);
+      }
+
+      template <typename T, typename U>
+      CATLASS_DEVICE void GatherMask_experiment(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src0,
+          const LocalTensor<U> &src1Pattern, const bool reduceMode,
+          const uint32_t mask, const uint32_t src0BlockStride,
+          const uint32_t repeatTimes, uint32_t src0RepeatStride,
+          const uint32_t src1RepeatStride, uint64_t rsvdCnt) {
+        GatherMaskParams gatherMaskParams;
+        gatherMaskParams.repeatTimes = repeatTimes;
+        gatherMaskParams.src0BlockStride = src0BlockStride;
+        gatherMaskParams.src0RepeatStride = src0RepeatStride;
+        gatherMaskParams.src1RepeatStride = src1RepeatStride;
+        GatherMask(dst, src0, src1Pattern, reduceMode, mask, gatherMaskParams,
+                   rsvdCnt);
+      }
+
+      template <typename T>
+      CATLASS_DEVICE void Fill_experiment(
+          const LocalTensor<T> &dst, const T &scalarValue, uint64_t mask0,
+          const uint8_t repeatTime, const uint16_t dstBlockStride,
+          const uint8_t dstRepeatStride) {
+        uint64_t mask[1] = {mask0};
+        AscendC::Duplicate(dst, scalarValue, mask, repeatTime, dstBlockStride,
+                           dstRepeatStride);
+      }
+
+      template <typename T>
+      CATLASS_DEVICE void Sum_experiment(
+          const LocalTensor<T> &dst, const LocalTensor<T> &src,
+          const uint32_t outter, const uint32_t inner, const uint32_t n) {
+        SumParams sumParams;
+        sumParams.outter = outter;
+        sumParams.inner = inner;
+        sumParams.n = n;
+        AscendC::Sum(dst, src, sumParams);
+      }
+
+      template <typename T, uint32_t H, uint32_t W>
+      CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
+                                          LocalTensor<T> const &src) {
+        constexpr uint32_t blockSize = 32 / sizeof(T);
+        constexpr uint32_t highBlock = H / 16;
+        constexpr uint32_t repeat = W / blockSize;
+
+        TransDataTo5HDParams params;
+        params.dstHighHalf = false;
+        params.srcHighHalf = false;
+        params.repeatTimes = repeat;
+        params.dstRepStride = repeat > 1 ? H : 0;
+        params.srcRepStride = repeat > 1 ? 1 : 0;
+
+        __ubuf__ T *dstList[16];
+        __ubuf__ T *srcList[16];
+
+        for (uint32_t i = 0; i < highBlock; i++) {
+          if constexpr (sizeof(T) == 2) {
+            for (int32_t m = 0; m < 16; m++)
+              dstList[m] = (__ubuf__ T *)dst[i * 16 + H * m].GetPhyAddr();
+            for (int32_t n = 0; n < 16; n++)
+              srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+            AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
+          } else if constexpr (sizeof(T) == 4) {
+            for (int32_t m = 0; m < 16; m = m + 2) {
+              dstList[m] = (__ubuf__ T *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
+              dstList[m + 1] =
+                  (__ubuf__ T *)dst[i * 16 + H * (m / 2) + blockSize]
+                      .GetPhyAddr();
+            }
+            for (int32_t n = 0; n < 16; n++)
+              srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+            AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
           }
         }
-
-        inOffset += totalElems * 2;
-        outOffset += totalElems * 2;
-        newNumSegs++;
+        AscendC::PipeBarrier<PIPE_V>();
       }
 
-      PipeBarrier<PIPE_V>();
-
-      uint32_t lastGroupStart = ((numSegs - 1) / 4) * 4;
-      uint32_t lastGroupCount = numSegs - lastGroupStart;
-      uint32_t newLastSegSize = 0;
-      for (uint32_t i = 0; i < lastGroupCount; i++) {
-        newLastSegSize +=
-            (lastGroupStart + i == numSegs - 1) ? lastSegSize : fullSegSize;
-      }
-
-      fullSegSize = (newNumSegs > 1) ? 4 * fullSegSize : newLastSegSize;
-      lastSegSize = newLastSegSize;
-      numSegs = newNumSegs;
-      readFromTmp = !readFromTmp;
-    }
-
-    // readFromTmp=true means last round wrote to tmp → result in tmp
-    if (readFromTmp) {
-      AscendC::DataCopy(dst, tmp, alignedCount * 2);
-    }
-  } else {
-    // Single block: Sort32 output is in tmp, copy to dst
-    AscendC::DataCopy(dst, tmp, alignedCount * 2);
-  }
-}
-
-template <typename T>
-CATLASS_DEVICE void ClampMax(const LocalTensor<T> &dst,
-                             const LocalTensor<T> &buffer,
-                             const LocalTensor<uint8_t> &tmp,
-                             const T scalarValue, const int32_t count) {
-  AscendC::ClampMax<T>(dst, buffer, tmp, scalarValue, count);
-}
-
-template <typename T>
-CATLASS_DEVICE void TopK(const LocalTensor<T> &dst, const LocalTensor<T> &src,
-                         const LocalTensor<T> &tmp, const int32_t K,
-                         const int32_t repeatTimes, const int32_t actualCount) {
-  // Use tmp as the full-size sort destination (2 * alignedCount elements).
-  // Sort writes its result into tmp's first region; we then copy the top-K
-  // portion into dst.
-  uint32_t alignedCount = repeatTimes * 32;
-  // sortDst needs 2 * alignedCount elements; reuse the tail of tmp.
-  // Layout of tmp: [0 .. 2*alignedCount-1] = sortDst, [2*alignedCount ..] =
-  // sortTmp
-  auto sortDst = tmp;
-  auto sortTmp = tmp[alignedCount * 2];
-  Sort<T>(sortDst, src, sortTmp, repeatTimes, actualCount);
-  PipeBarrier<PIPE_V>();
-  // Copy 2*K elements (interleaved value-index pairs) from sorted result to
-  // dst. DataCopy requires the byte count to be a multiple of 32 bytes, so
-  // round up.
-  uint32_t topkElems = 2 * K;
-  constexpr uint32_t elemsPerBlock = 32 / sizeof(T);
-  uint32_t alignedTopk =
-      ((topkElems + elemsPerBlock - 1) / elemsPerBlock) * elemsPerBlock;
-  AscendC::DataCopy(dst, sortDst, alignedTopk);
-}
-
-template <typename T>
-CATLASS_DEVICE void ClampMin(const LocalTensor<T> &dst,
-                             const LocalTensor<T> &buffer,
-                             const LocalTensor<uint8_t> &tmp,
-                             const T scalarValue, const int32_t count) {
-  AscendC::ClampMin<T>(dst, buffer, tmp, scalarValue, count);
-}
-
-template <typename T>
-CATLASS_DEVICE void
-Clamp(const LocalTensor<T> &dst, const LocalTensor<T> &buffer,
-      const LocalTensor<uint8_t> &tmp, const T minScalarValue,
-      const T maxScalarValue, const int32_t count) {
-  AscendC::ClampMin<T>(dst, buffer, tmp, minScalarValue, count);
-  AscendC::ClampMax<T>(dst, dst, tmp, maxScalarValue, count);
-}
-
-template <typename T, typename U>
-CATLASS_DEVICE void
-GatherMask_experiment(const LocalTensor<T> &dst, const LocalTensor<T> &src0,
-                      const LocalTensor<U> &src1Pattern, const bool reduceMode,
-                      const uint32_t mask, const uint32_t src0BlockStride,
-                      const uint32_t repeatTimes, uint32_t src0RepeatStride,
-                      const uint32_t src1RepeatStride, uint64_t rsvdCnt) {
-  GatherMaskParams gatherMaskParams;
-  gatherMaskParams.repeatTimes = repeatTimes;
-  gatherMaskParams.src0BlockStride = src0BlockStride;
-  gatherMaskParams.src0RepeatStride = src0RepeatStride;
-  gatherMaskParams.src1RepeatStride = src1RepeatStride;
-  GatherMask(dst, src0, src1Pattern, reduceMode, mask, gatherMaskParams,
-             rsvdCnt);
-}
-
-template <typename T>
-CATLASS_DEVICE void
-Fill_experiment(const LocalTensor<T> &dst, const T &scalarValue, uint64_t mask0,
-                const uint8_t repeatTime, const uint16_t dstBlockStride,
-                const uint8_t dstRepeatStride) {
-  uint64_t mask[1] = {mask0};
-  AscendC::Duplicate(dst, scalarValue, mask, repeatTime, dstBlockStride,
-                     dstRepeatStride);
-}
-
-template <typename T>
-CATLASS_DEVICE void
-Sum_experiment(const LocalTensor<T> &dst, const LocalTensor<T> &src,
-               const uint32_t outter, const uint32_t inner, const uint32_t n) {
-  SumParams sumParams;
-  sumParams.outter = outter;
-  sumParams.inner = inner;
-  sumParams.n = n;
-  AscendC::Sum(dst, src, sumParams);
-}
-
-template <typename T, uint32_t H, uint32_t W>
-CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
+      template <typename T, uint32_t FullM = 16, uint32_t FullN = 16>
+      CATLASS_DEVICE void transpose(LocalTensor<T> const &dst,
                                     LocalTensor<T> const &src) {
-  constexpr uint32_t blockSize = 32 / sizeof(T);
-  constexpr uint32_t highBlock = H / 16;
-  constexpr uint32_t repeat = W / blockSize;
+        if constexpr (FullM == 16 && FullN == 16 && sizeof(T) == 2 &&
+                      !std::is_same_v<T, bfloat16_t>) {
+          AscendC::Transpose(dst, src);
+          return;
+        }
 
-  TransDataTo5HDParams params;
-  params.dstHighHalf = false;
-  params.srcHighHalf = false;
-  params.repeatTimes = repeat;
-  params.dstRepStride = repeat > 1 ? H : 0;
-  params.srcRepStride = repeat > 1 ? 1 : 0;
-
-  __ubuf__ T *dstList[16];
-  __ubuf__ T *srcList[16];
-
-  for (uint32_t i = 0; i < highBlock; i++) {
-    if constexpr (sizeof(T) == 2) {
-      for (int32_t m = 0; m < 16; m++)
-        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * m].GetPhyAddr();
-      for (int32_t n = 0; n < 16; n++)
-        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
-      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
-    } else if constexpr (sizeof(T) == 4) {
-      for (int32_t m = 0; m < 16; m = m + 2) {
-        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
-        dstList[m + 1] =
-            (__ubuf__ T *)dst[i * 16 + H * (m / 2) + blockSize].GetPhyAddr();
+        if constexpr (FullM % 16 == 0 && FullN % 16 == 0 &&
+                      (sizeof(T) == 2 || sizeof(T) == 4) &&
+                      !std::is_same_v<T, bfloat16_t>) {
+          transpose_block<T, FullM, FullN>(dst, src);
+        } else {
+          for (uint32_t i = 0; i < FullM; i++)
+            for (uint32_t j = 0; j < FullN; j++)
+              dst.SetValue(j * FullM + i, src.GetValue(i * FullN + j));
+        }
       }
-      for (int32_t n = 0; n < 16; n++)
-        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
-      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
-    }
-  }
-  AscendC::PipeBarrier<PIPE_V>();
-}
 
-template <typename T, uint32_t FullM = 16, uint32_t FullN = 16>
-CATLASS_DEVICE void transpose(LocalTensor<T> const &dst,
-                              LocalTensor<T> const &src) {
-  if constexpr (FullM == 16 && FullN == 16 && sizeof(T) == 2 &&
-                !std::is_same_v<T, bfloat16_t>) {
-    AscendC::Transpose(dst, src);
-    return;
-  }
-
-  if constexpr (FullM % 16 == 0 && FullN % 16 == 0 &&
-                (sizeof(T) == 2 || sizeof(T) == 4) &&
-                !std::is_same_v<T, bfloat16_t>) {
-    transpose_block<T, FullM, FullN>(dst, src);
-  } else {
-    for (uint32_t i = 0; i < FullM; i++)
-      for (uint32_t j = 0; j < FullN; j++)
-        dst.SetValue(j * FullM + i, src.GetValue(i * FullN + j));
-  }
-}
-
-} // namespace tl::ascend
+    } // namespace tl::ascend

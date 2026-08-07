@@ -3461,7 +3461,6 @@ CodeGenTileLangAscendPto::ParseReduceOpInfo(const std::string &op_name) {
   info.buffer_slice_col = slice_col;
   info.direction =
       (direction_val == -1) ? ReduceDirection::ROW : ReduceDirection::COL;
-
   if (op_name.find("reduce_sum") != std::string::npos) {
     info.kind = ReduceKind::SUM;
   } else if (op_name.find("reduce_max") != std::string::npos) {

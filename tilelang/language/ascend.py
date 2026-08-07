@@ -628,3 +628,25 @@ def set_deq_scale(scale: PrimExpr):
         tvm.tir.Call: A TIR intrinsic call to `tl.ascend_set_deq_scale`.
     """
     return T.call_intrin("handle", tir.op.Op.get("tl.ascend_set_deq_scale"), scale)
+
+
+######
+
+
+def square(dst: Buffer, src0: Buffer):
+    import math
+
+    size_0 = math.prod(src0.shape)
+    size_1 = math.prod(dst.shape)
+    assert size_0 == size_1, "size must be same"
+
+    return T.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.ascend_square"),
+        dst.access_ptr("w"),
+        src0.access_ptr("r"),
+        size_0,
+    )
+
+
+######

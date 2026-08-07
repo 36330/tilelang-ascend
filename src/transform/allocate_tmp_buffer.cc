@@ -724,6 +724,23 @@ private:
 
 class CallNodeModifier : public StmtExprMutator {
 public:
+  //////
+  // static Stmt Modify(PrimFunc f, Target target, Buffer &tmp_buffer,
+  //                    Array<Buffer> &tmp_buffers,
+  //                    Buffer &reduce_out_tmp_buffer) {
+  //   CallNodeModifier modifier;
+  //   modifier.target_ = Downcast<String>(target.get()->attrs["model"]);
+  //   if ("pto" == modifier.target_) {
+  //     modifier.tmp_arg_ops_ = pto_tmp_arg_ops;
+  //   } else if ("ascendc" == modifier.target_ || "auto" == modifier.target_) {
+  //     modifier.tmp_arg_ops_ = ascendc_tmp_arg_ops;
+  //   }
+  //   modifier.tmp_buf_ = tmp_buffer;
+  //   modifier.tmp_bufs_ = tmp_buffers;
+  //   modifier.reduce_out_tmp_buf_ = reduce_out_tmp_buffer;
+  //   return modifier.AddTmpArg(f->body);
+  // }
+
   static Stmt Modify(PrimFunc f, Target target, Buffer &tmp_buffer,
                      Buffer &reduce_out_tmp_buffer,
                      const Array<Buffer> &alloc_buffers) {
@@ -734,6 +751,8 @@ public:
     modifier.alloc_buffers_ = alloc_buffers;
     return modifier.AddTmpArg(f->body);
   }
+
+  //////
 
 private:
   Stmt AddTmpArg(const Stmt &stmt) { return VisitStmt(stmt); }
@@ -1032,6 +1051,11 @@ public:
         CallNodeCollector::Collect(f, target, injector.alloc_buffers_);
     Stmt new_body = injector.inject(f->body);
     fptr->body = new_body;
+    //////
+    // new_body = CallNodeModifier::Modify(f, target, injector.tmp_buf_,
+    //                                     injector.tmp_bufs_,
+    //                                     injector.reduce_out_tmp_buf_);
+
     new_body = CallNodeModifier::Modify(f, target, injector.tmp_buf_,
                                         injector.reduce_out_tmp_buf_,
                                         injector.alloc_buffers_);
@@ -1061,6 +1085,12 @@ private:
       if (tmp_buf_.defined()) {
         new_alloc_buffers.push_back(tmp_buf_);
       }
+      //////
+      cumsum_last_row_buf_ = createCumSumLastRowBuffer_(op->alloc_buffers);
+      if (cumsum_last_row_buf_.defined()) {
+        new_alloc_buffers.push_back(cumsum_last_row_buf_);
+      }
+      //////
 
       if ("pto" == target_) {
         reduce_out_tmp_buf_ = createPTOClearReduceOutputTmpBuffer_(

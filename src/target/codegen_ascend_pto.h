@@ -69,7 +69,7 @@ public:
   void ReinterpretCastCodegen(const CallNode *op);
   void ReduceOpCodegen(const CallNode *op);
 
-  enum class ReduceKind { SUM, MAX, MIN };
+  enum class ReduceKind { SUM, MAX, MIN, ABSSUM, ABSMAX };
   enum class ReduceDirection { ROW, COL };
 
   struct ReduceOpInfo {

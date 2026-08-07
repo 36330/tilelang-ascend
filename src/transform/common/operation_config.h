@@ -212,6 +212,10 @@ GetOperationConfig() {
        {{{0, "write"}, {1, "read"}, {2, "read"}}, "PIPE_V"}},
       {"tl.ascend_reduce",
        {{{1, "write"}, {2, "read"}, {3, "read"}}, "PIPE_V"}},
+      //////
+      {"tl.ascend_cumsum",
+       {{{1, "write"}, {2, "read"}, {3, "read"}, {4, "write"}}, "PIPE_V"}},
+      //////
       {"tl.ascend_block_reduce_max", {{{0, "write"}, {1, "read"}}, "PIPE_V"}},
       {"tl.ascend_block_reduce_min", {{{0, "write"}, {1, "read"}}, "PIPE_V"}},
       {"tl.ascend_block_reduce_sum", {{{0, "write"}, {1, "read"}}, "PIPE_V"}},
