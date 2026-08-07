@@ -161,6 +161,8 @@ private:
   void RowExpandBinOpExperimentCodegen(const CallNode *op,
                                        const std::string &mask_op_name);
 
+  void ExpExperimentCodegen(const CallNode *op);
+
   void SetCrossFlagCodegen(const CallNode *op);
 
   void FlagOpCodegen(const CallNode *op, std::string op_name);
@@ -172,6 +174,8 @@ private:
   void PrintfOpCodegen(const CallNode *op, const std::string &op_name);
 
   void DumpTensorCodegen(const CallNode *op);
+
+  void SrcCodeCodegen(const CallNode *op);
 
   void BilinearInterpolationCodegen(const CallNode *op);
 
@@ -271,9 +275,13 @@ private:
 
   bool use_swizzle_{false};
 
+  bool enable_exception_dump_{false};
+
   std::string platform_;
 
   Map<Var, Array<PrimExpr>> buffer_shapes_;
+
+  std::unordered_map<const VarNode *, DataType> buffer_dtypes_;
 };
 
 } // namespace codegen

@@ -106,9 +106,35 @@ public:
     Array<PrimExpr> shape;
   };
 
+  struct PipeInfo {
+    // From PASS attr (pipe_infos)
+    int flag_id;
+    int dir_type;
+    int slot_size;
+    int slot_num;
+    std::string pipe_id;
+    std::string op_name;
+    std::string dtype_str;
+    int src_M_val = 0;
+    int src_N_val = 0;
+    int dst_M_val = 0;
+    int dst_N_val = 0;
+    int split_axis = 1; // 0=TILE_NO_SPLIT, 1=TILE_UP_DOWN, 2=TILE_LEFT_RIGHT
+    std::string workspace_name; // e.g. "workspace_0" for A2 PTO, empty for A5
+    bool has_tmp = false;
+    int tmp_M_val = 0;
+    int tmp_N_val = 0;
+    // Computed by codegen
+    std::string pipe_type_name;
+    std::string dir_full;
+    std::string c2v_buf;
+    std::string v2c_buf;
+  };
+
 private:
   void AutoBarrierCodegen(const CallNode *op);
   void AutoFlagOpCodegen(const CallNode *op, std::string op_name);
+  void PrintPipeDeclarations(const std::string &block_id);
 
 private:
   // Whether scope such as "__shared__" or "__constant__"  is part of type.
@@ -207,6 +233,8 @@ private:
 
   void DumpTensorCodegen(const CallNode *op, const std::string &op_name);
 
+  void SrcCodeCodegen(const CallNode *op);
+
   void BroadcastOpCodegen(const CallNode *op);
 
   void RowExpandMulCodegen(const CallNode *op);
@@ -235,9 +263,21 @@ private:
 
   void GMCopyCall(const CallNode *call, std::string op_name);
 
+  void CopyUBToUBNzCodegen(const CallNode *call);
+
   void CopyUBToUBCodegen(const CallNode *call);
 
   void CopyL1ToL0Codegen(const CallNode *call, bool is_a);
+
+  void CopyPipeCodegen(const CallNode *call, bool is_producer);
+
+  void FreePipeCodegen(const CallNode *call);
+
+  void PreScanPipes(const PrimFunc &f);
+
+  void CopyCVExperimentCodegen(const CallNode *op);
+
+  void CopyVCExperimentCodegen(const CallNode *op);
 
   std::string PrintBufferOffset(const CallNode *op);
 
@@ -265,13 +305,15 @@ private:
 
   ReduceOpInfo ParseReduceOpInfo(const std::string &op_name);
   std::string GetReduceOpName(ReduceKind kind, ReduceDirection direction);
+  ShapeInfo ReinterpretShapeInfo(const ShapeInfo &info,
+                                 const std::string &type);
   std::string ResolveColReduceTmpName(const ShapeInfo &dst,
                                       const ShapeInfo &src,
                                       const ShapeInfo &tmp);
   void CodegenRowReduce(const ReduceOpInfo &op_info, const ShapeInfo &dst,
                         const ShapeInfo &src, const ShapeInfo &tmp);
   void CodegenColReduce(const ReduceOpInfo &op_info, const ShapeInfo &dst,
-                        const ShapeInfo &src, const ShapeInfo &tmp);
+                        const ShapeInfo &src);
 
   void CodegenRowBroadcast(const ShapeInfo &dst, const ShapeInfo &src);
   void CodegenColBroadcast(const ShapeInfo &dst, const ShapeInfo &src);
@@ -310,6 +352,7 @@ private:
   Map<Var, PrimExpr> address_map_;
   Map<Var, Array<PrimExpr>> buffer_shapess_;
   Map<Var, PrimExpr> buffer_versions_;
+  std::unordered_map<const VarNode *, DataType> buffer_dtypes_;
 
   Map<Var, PrimExpr> tiling_map_;
   Array<Var> var_sequence_;
@@ -348,7 +391,11 @@ private:
 
   std::unordered_map<std::string, int32_t> counters_;
 
+  std::map<int, PipeInfo> pipe_registry_;
+
   bool use_swizzle_{false};
+
+  bool enable_exception_dump_{false};
 
   std::string platform_;
 

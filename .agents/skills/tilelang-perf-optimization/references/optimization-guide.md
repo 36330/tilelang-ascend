@@ -4,16 +4,31 @@
 
 - [一、优化优先级与算子类型对应](#一优化优先级与算子类型对应)
 - [二、核内优化](#二核内优化)
+  - [2.1 Split-K 切分策略（Cube 核）](#21-split-k-切分策略cube-核)
+  - [2.2 Double Buffer（Cube / Vector 核通用）](#22-double-buffercube--vector-核通用)
+  - [2.3 MTE2 预取优化（Cube 核）](#23-mte2-预取优化cube-核)
+  - [2.4 减少重复载入 / Full-Load（Cube 核）](#24-减少重复载入--full-loadcube-核)
+  - [2.5 小数据块合并载入（Cube 核）](#25-小数据块合并载入cube-核)
+  - [2.6 指令向量化（Vector 核）](#26-指令向量化vector-核)
+  - [2.7 指令融合（Vector 核）](#27-指令融合vector-核)
+  - [2.8 稀疏访存优化（Vector 核）](#28-稀疏访存优化vector-核)
+  - [2.9 Fixed Core 模式（所有算子类型通用）](#29-fixed-core-模式所有算子类型通用)
+  - [2.10 pass_configs 调优（最后手段）](#210-pass_configs-调优最后手段)
+  - [2.11 UB 预算优化（Vector 核 tile size 首选方法）](#211-ub-预算优化vector-核-tile-size-首选方法)
+  - [2.12 Host 侧预处理内化（消除 pad / contiguous）](#212-host-侧预处理内化消除-pad--contiguous)
+  - [2.12.1 Stride Buffer 归一化（消除非连续数据的 host 物理拷贝）](#2121-stride-buffer-归一化消除非连续数据的-host-物理拷贝)
   - [2.13 多行 Tile 粒度扩展（Multi-row Tile Granularity）](#213-多行-tile-粒度扩展multi-row-tile-granularity)
-    - [2.13.9 动态 block_S 计算（UB 预算反推）](#2139-动态-block_s-计算多行-tile-强制不可固定值)
-    - [2.13.10 多行 Tile 强制配套 pass_configs](#21310-多行-tile-强制配套-pass_configs)
+  - [2.14 Host 侧 D2H 消除（输出后处理 NPU 化）](#214-host-侧-d2h-消除输出后处理-npu-化)
+  - [2.15 正交轴向量化（Orthogonal Axis Vectorization）](#215-正交轴向量化orthogonal-axis-vectorization)
+  - [2.16 特定 dtype 的硬件指令适配（Dtype-Specific Hardware Path Adaptation）](#216-特定-dtype-的硬件指令适配dtype-specific-hardware-path-adaptation)
+  - [2.17 离散重排 fallback 的多阶段连续化](#217-离散重排-fallback-的多阶段连续化)
 - [三、核间优化](#三核间优化)
 - [四、常见问题速查](#四常见问题速查)
 
 ### 相关 Skill 参考（优化前必读）
 
 - **API 用法**：查阅 [tilelang-api-best-practices SKILL.md](../../tilelang-custom-skill/tilelang-api-best-practices/SKILL.md) 及其 references 目录
-- **编程模式和 pass_configs**：查阅 [tilelang-expert-to-developer SKILL.md](../../tilelang-custom-skill/tilelang-expert-to-developer/SKILL.md) 及其 references 目录
+- **编程模式和 pass_configs**：查阅 [tilelang-programming-model-guide SKILL.md](../../tilelang-custom-skill/tilelang-programming-model-guide/SKILL.md) 及其 references 目录
 
 ---
 
@@ -42,7 +57,7 @@
 
 > **优化顺序**：
 > - **Cube 型算子**：执行 Cube 核内优化（2.1 Split-K 切分策略、2.2 Double Buffer、2.3 MTE2 预取、2.4 Full-Load、2.5 小数据块合并载入）+ 2.9 Fixed Core
-> - **Vector 型算子**：执行 Vector 核内优化（2.2 Double Buffer Vector 侧、2.6 指令向量化、2.7 指令融合、2.8 稀疏访存优化）+ 2.9 Fixed Core
+> - **Vector 型算子**：执行 Vector 核内优化（2.2 Double Buffer Vector 侧、2.6 指令向量化、2.7 指令融合、2.8 稀疏访存优化）+ 2.9 Fixed Core；归约维度需分块扫描时额外参考 [归约遍数融合](vector-practices/vector_reduce_pass_fusion.md)
 > - **CV 融合型算子**：先执行 Cube 核内优化 → 再执行 Vector 核内优化 → 最后执行核间优化（见第三章）+ 2.9 Fixed Core
 
 ### 2.1 Split-K 切分策略（Cube 核）
@@ -86,7 +101,7 @@ for k in T.serial(loop_k):
   - Vector 核：切分后每个数据块元素数应 ≥ 128
   - Cube 核：切分后每个数据块元素数应 ≥ 256
 - 实现方式：手写 Double Buffer（手动分配双份 buffer，通过 `side = k % 2` 交替使用）
-- 同步方式：Vector/Cube 核内流水当前需要手动控制不同流之间的同步。同步模式选择见下方 §2.2.0 决策表。**`set_flag` / `wait_flag` / `barrier_all` 的底层机理、双缓冲 Flag 完整模式详见 [sync-primitives-guide.md](../sync-primitives-guide.md)**
+- 同步方式：Vector/Cube 核内流水当前需要手动控制不同流之间的同步。同步模式选择见下方 §2.2.0 决策表。**`set_flag` / `wait_flag` / `barrier_all` 的底层机理、双缓冲 Flag 完整模式详见 [api-schedule-sync.md](../../tilelang-custom-skill/tilelang-api-best-practices/references/api-schedule-sync.md)**
 
 #### 2.2.0 同步模式决策表（Double Buffer 实施前必须先判断）
 
@@ -558,6 +573,37 @@ def find_max_tile(total_dim, fixed_dim, N_cal, N_input, dtype_str):
 - 只计算**同时活跃**的 buffer，双缓冲 input/output 算双份
 - 开启 `TL_ASCEND_MEMORY_PLANNING: True` 后编译器自动复用已死亡 buffer
 
+#### T.tile.select 模式选择（影响 tile size 上限与 UB 占用）
+
+**适用场景**：kernel 中使用 `T.tile.compare` + `T.tile.select` 组合（如条件选择、argmin/argmax 索引更新、排序等）。不限于正交轴向量化场景——任何用到 compare+select 的 Vector 算子均需关注。
+
+`T.tile.select` 有两种掩码读取模式，**必须在 UB 预算反推之前确定**，因为它约束 N 的上限和对齐：
+
+| 模式 | 掩码来源 | 速度 | 上限 | 适用条件 |
+|------|---------|------|------|---------|
+| `VSEL_CMPMASK_SPR` | 64 位 CMPMASK 特殊寄存器 | 快（寄存器读，无 UB 访问） | **64 元素** | N ≤ 64 且非 int32 |
+| `VSEL_TENSOR_TENSOR_MODE` | UB tensor buffer | 稍慢（额外 UB 读） | 仅受 UB 约束 | N > 64 或 int32 |
+
+**关键约束**：当 N > 64 时用 SPR 模式，`compare` 会被拆成多条子指令，SPR 只保留最后一块掩码，前面的被覆盖 → **index 静默错误（value 仍正确）**。这是正确性问题，不是性能问题。
+
+**选择方式**（JIT 编译期常量，零运行时开销）：
+
+```python
+_VEC_ALIGN = 64  # 256B compare 对齐（fp32: 64*4=256B）
+
+# N 是 JIT 编译期常量，sel_mode 在编译时就确定了
+sel_mode = "VSEL_CMPMASK_SPR" if (N <= _VEC_ALIGN and dtype != "int32") \
+           else "VSEL_TENSOR_TENSOR_MODE"
+```
+
+**对 UB 预算反推的影响**：
+
+1. **N 对齐**：`T.tile.compare` 要求 256 字节对齐（fp32=64 元素，fp16=128 元素）。N 必须 64 对齐，`find_max_tile` 的对齐基数应使用 `_VEC_ALIGN=64` 而非默认的 16。
+2. **N 上限**：若选 SPR 模式，N 上限锁定 64；若选 tensor 模式，N 上限仅受 UB 约束。两种模式的 per-elem bytes 相同（`compare` 始终写 mask 到 UB buffer，`select` 从 SPR 或 UB 读），但 tensor 模式的 mask buffer 生命周期需覆盖 select 调用。
+3. **int32 限制**：int32 的 `select` 在 SPR 模式下不可用（底层 `VSEL_CMPMASK_SPR` 对 int32 操作数行为未定义），必须用 tensor 模式。
+
+> **实践建议**：小 shape（N=64）优先 SPR 快路径；大 shape（N>64）用 tensor 模式保正确。N 的确定参考 §2.15 的核优先策略（先吃满核再吃满 UB）。
+
 #### Vector 核参数广播模式（5 步）
 
 参数在 kernel 签名中**必须声明为 2D** `(G, rows)`，kernel 内 copy **必须用 1D 切片** `param[g, 0:rows]`（禁止 2D 切片，否则 DMA stride 导致数据错位）。
@@ -585,11 +631,81 @@ T.copy(gamma_bc_full[0:rows, 0:block_S], gamma_bc)
 
 UB 预算**必须在所有 kernel 级优化完成后最后实施**（多行 Tile 改变 tile 形状、Double Buffer 让 buffer 翻倍、指令融合减少临时 buffer——任何一项在 UB 预算之后实施都会导致返工重算）。
 
+#### 扫描轴批量搬运（减少 UB↔GM 往返次数）
+
+**适用场景**：kernel 内存在沿扫描轴（有前缀依赖的轴，如 prefix scan / cummin / cumsum）的串行循环，每次迭代单独做 GM→UB 读 + UB→GM 写。当扫描轴较长时，DMA 头开销和 barrier 同步成为瓶颈。
+
+**核心思路**：用剩余 UB 容量沿扫描轴方向批量搬入多行（`block_L` 行），在 UB 内完成整块扫描后一次性搬出。将 GM↔UB 往返次数和 barrier 次数从 `O(L)` 降到 `O(L/block_L)`。
+
+**与正交轴 tile size 的联合预算**：
+
+UB 空间被正交轴 tile（`[N]` 或 `[rows, N]`）和扫描轴 tile（`[block_L, N]`）共享，必须联合反推——先定正交轴 N（受核利用率 + compare/select 对齐约束），再用剩余 UB 反推 block_L：
+
+```python
+def find_block_scan(N, L, dtype_str, tile_bytes_per_elem, resident_bytes_per_elem):
+    """用剩余 UB 反推扫描轴 block_L。
+    
+    N 已由正交轴约束确定（核优先 + select 模式对齐），block_L 填满剩余 UB。
+    """
+    UB_BUDGET = 192 * 1024
+    resident = resident_bytes_per_elem * N          # [1,N] 运行态 buffer
+    avail = UB_BUDGET - resident
+    block_L = avail // (N * tile_bytes_per_elem)    # [block_L, N] 大 tile
+    return max(1, min(block_L, L))
+```
+
+**kernel 内层重构为三段式**（规避 tvmscript 循环形式限制）：
+
+1. **块 0**（python-int base 0，做扫描轴位置 0 的初始化）
+2. **满块 1..n_full-1**（`for bi in T.serial(1, n_full)`）
+3. **尾块**（`partial = L % block_L`，仅当 >0）
+
+每块：一次 `T.copy GM→UB [block_L, N]` → 块内逐行扫描（只读 UB，运行态在 `[1, N]` buffer 滚动，无 GM 往返）→ 块末一次 `T.copy UB→GM`。
+
+```python
+n_full = L // block_L    # JIT 编译期 Python 整数
+partial = L % block_L
+
+# 块 0：搬入 + 初始化 + 逐行扫描 + 搬出
+T.copy(A[0:block_L, col:col+N], in_tile)
+# ... init running state from row 0 ...
+for jj in range(1, block_L):
+    # ... compare/select/min on in_tile[jj, :] ...
+T.copy(val_tile, Values[0:block_L, col:col+N])
+
+# 满块 1..n_full-1
+if n_full > 1:
+    for bi in T.serial(1, n_full):
+        l_base = bi * block_L
+        T.copy(A[l_base:l_base+block_L, col:col+N], in_tile)
+        for jj in range(block_L):
+            # ... compare/select/min on in_tile[jj, :] ...
+        T.copy(val_tile, Values[l_base:l_base+block_L, col:col+N])
+
+# 尾块
+if partial > 0:
+    tb = n_full * block_L
+    T.copy(A[tb:tb+partial, col:col+N], in_tile[0:partial, :])
+    for jj in range(partial):
+        # ... compare/select/min on in_tile[jj, :] ...
+    T.copy(val_tile[0:partial, :], Values[tb:tb+partial, col:col+N])
+```
+
+**关键约束**：
+
+- `n_full` / `partial` 必须是 JIT 编译期 Python 整数（用 `//` 和 `%` 计算），TIR 变量会导致条件无法求值
+- `block_L` 无需对齐（它是外层行索引，N 已携带对齐）；但块内 `T.copy` 的 2D slice 要求行维在 GM 中连续
+- 运行态 buffer（如 `run_min`、`run_idx`）为 `[1, N]`，跨块保持，块间不回写 GM
+
+> **实测收益**：case [1024,1024] fp16 dim=-1，block_L=170 时 barrier 从 ~1024 降到 ~7，耗时 490μs→146μs（3.35×）。
+
 #### 检查清单
 
 - [ ] tile size 通过 `find_max_tile` 反推（非硬编码），无硬编码上限？
 - [ ] 枚举了所有同时活跃的 buffer（双缓冲算双份）？
 - [ ] 16 元素对齐？优先找整除值？
+- [ ] 若使用 `T.tile.select`：select 模式已按 N 动态选择（N≤64 且非 int32 → SPR，否则 tensor）？
+- [ ] 若存在扫描轴串行循环：已用 `find_block_scan` 反推 block_L 做批量搬运？
 - [ ] 开启 `TL_ASCEND_MEMORY_PLANNING: True`？
 - [ ] UB 预算在所有 kernel 级优化完成后最后实施？
 
@@ -598,6 +714,8 @@ UB 预算**必须在所有 kernel 级优化完成后最后实施**（多行 Tile
 ### 2.12 Host 侧预处理内化（消除 pad / contiguous）
 
 **适用场景**：Host 中有 `F.pad` / `.contiguous()` / padded tensor 传入 kernel。
+
+**诊断方法**：当整体性能不达标时，需分离 host 侧操作耗时和 kernel 耗时，定位瓶颈在 host 还是 kernel。分别计时 host 侧各步操作（`permute`/`reshape`/stride 计算等 view 操作应接近 0；`reshape(-1)` 或 `.contiguous()` 如有显著耗时说明触发了物理拷贝）和 kernel 调用本身。如果 host 操作耗时接近或超过 kernel，说明 host 侧有隐式拷贝，需用本节的 stride buffer 方案消除。任何 host wrapper 中有 `reshape`/`contiguous`/`permute` 等操作的算子均应做此分离诊断。
 
 **核心思路**：Host 直接传原始 tensor（不 pad、不 contiguous），Kernel 用「整块循环 + 余数块」覆盖所有数据，Host 对输出做 view-slice 裁剪。
 
@@ -656,6 +774,147 @@ if partial > 0:
 - [ ] 余数块 buffer 为完整块大小（K3）？output 按 padded 声明（K4）？
 - [ ] fill 在 copy 之前（K5）？循环用 `n_full`（K6）？
 - [ ] 优化后精度与优化前一致？
+
+#### 减少 transpose 优化
+
+**适用场景**：kernel 要求数据按特定轴序排列（如 scan 维在前、并行轴在后），host 侧用 `transpose` + `.contiguous()` 物理重排数据。大 shape 下全量转置是主要瓶颈之一。
+
+**核心原理**：`transpose` / `movedim` / `.t()` / `reshape` 都是**零成本 view**（只改 stride，不搬数据），`.contiguous()` 才触发物理数据搬运。优化目标是**最小化 `.contiguous()` 调用次数**。
+
+**识别可优化场景**：当 host 侧出现以下任意一种模式时，存在可消除的 transpose：
+
+**场景 1：两次 view 交换轴最终抵消，中间 `.contiguous()` 是冗余的**
+
+```python
+# 问题：transpose → contiguous → .t() → contiguous = 两次物理转置，但轴交换抵消了
+xt = x.transpose(d, -1).contiguous()   # 转置1
+x_LR = xt.t().contiguous()             # 转置2（与转置1抵消！）
+```
+
+**场景 2：kernel 可以直接接受原始物理布局，host 侧转置完全不需要**
+
+```python
+# 问题：数据原始布局是 [M, R, N]（row-major），kernel 要求 [R, M*N]（scan 维在前）
+# host 做 movedim + contiguous = 1 次转置
+# 但若 kernel 改为在 [M*R, N] 上操作（原始布局 flatten），则零转置
+x_LR = x.movedim(d, 0).contiguous()    # 1 次转置（可避免）
+```
+
+**场景 3：输出侧的转回也是冗余的**
+
+```python
+# 问题：kernel 输出 [L, Rows]，host 需要转回原始 shape
+out = out_LR.movedim(0, d).contiguous()  # 1 次转置
+# 若 kernel 直接输出原始 shape 的布局，则零转置
+```
+
+**场景 4：`reshape` 对非 contiguous 张量触发隐式拷贝（最隐蔽）**
+
+`reshape` 在张量 contiguous 时是零拷贝 view，但对非 contiguous 张量会触发物理拷贝，等价于 `.contiguous()`。代码中没有 `.contiguous()` 字样，但行为完全相同——是最容易遗漏的性能陷阱。**不限于 transpose 场景**，任何对非 contiguous 张量做 `reshape`（尤其是 `reshape(-1)`）的算子均可能命中。
+
+```python
+# ❌ reshape(-1) 对非 contiguous 张量等价于 .contiguous()
+x_perm = x.permute(perm)                          # 非 contiguous
+x_3d = x_perm.reshape(-1).reshape(batch, M, N)    # reshape(-1) 触发物理拷贝！
+```
+
+**识别方法**：搜索所有 `reshape`，检查目标 shape 与当前 stride 是否兼容，并验证结果
+是否共享原 storage。`is_contiguous() == True` 是常见充分条件；False 不等于必然复制。
+
+**优化方法**：用 stride buffer 归一化替代（host 侧只算 stride 参数传入 kernel，kernel 内逐行搬运），消除 host 侧物理拷贝。详见下方「Stride Buffer 归一化」模式。
+
+**优化方法**：
+
+**方法 1：合并 view 操作，减少 `.contiguous()` 次数**
+
+将多次 `transpose/reshape` 合并为一次 `movedim + reshape`，只在最终布局非 contiguous 时做一次 `.contiguous()`：
+
+```python
+# 优化前：两次 .contiguous()
+xt = x.transpose(d, -1).contiguous()
+x_LR = xt.t().contiguous()
+
+# 优化后：一次 movedim（零成本 view）+ 一次 contiguous（仅非 contiguous 时触发）
+xm = x.movedim(d, 0)
+x_LR = xm.reshape(L, Rows).contiguous()
+```
+
+各操作成本：
+
+| 操作 | 成本 | 说明 |
+|------|------|------|
+| `movedim(d, 0)` | 零（view） | 只改 stride，不搬数据 |
+| `.reshape(L, Rows)` | 零（view） | 连续内存的 reshape 是 view |
+| `.contiguous()` | 一次转置 | 仅当 view 非 contiguous 时才拷贝 |
+
+**方法 2：kernel 直接接受原始物理布局，消除全部转置**
+
+当 kernel 的数据访问模式可以适配原始 row-major 布局时，host 侧只需 `reshape`（view），完全不需要 `.contiguous()`：
+
+```python
+# 优化前：host 转置到 kernel 期望的 [L, Rows]
+x_LR = x.movedim(d, 0).reshape(L, Rows).contiguous()  # 1 次转置
+
+# 优化后：kernel 接受 [M*R, N]（原始布局 flatten），host 只 reshape
+x_2d = x.reshape(M * R, N)  # 零拷贝 view
+```
+
+这需要 kernel 设计与 host 布局联合考虑——kernel 内部的 `T.copy` 切片必须匹配原始布局的内存连续性。
+
+**通用判断流程**：
+
+```
+1. 找到 host 侧所有 .contiguous() 调用
+2. 对每个 .contiguous()，检查：
+   a. 它之前的 view 操作是否与前一个 .contiguous() 的 view 操作抵消？
+      → 是：合并为一次 movedim + reshape + contiguous（方法 1）
+   b. kernel 是否可以改为直接接受当前布局？
+      → 是：删除 .contiguous()，kernel 用 reshape 后的 view（方法 2）
+3. 对输出侧重复上述检查
+```
+
+**示例：cummin 的 movedim 优化**
+
+cummin 向量核要求 scan 维在前 `[L, Rows]`。原始数据是 `[D0, D1, ..., Ddim, ...]` row-major。
+
+```python
+# 优化前：两次转置
+xt = x.transpose(d, -1).contiguous()   # fold 到 [Rows, L]
+x_LR = xt.t().contiguous()             # 翻成 [L, Rows]
+
+# 优化后（方法 1）：movedim 替代，一次 contiguous
+xm = x.movedim(d, 0)
+x_LR = xm.reshape(L, Rows).contiguous()   # d==0 时零转置；否则 1 次
+out = out_LR.reshape(moved_shape).movedim(0, d).contiguous()
+
+# 进一步优化（方法 2）：v2 kernel 直接在 [M*R, N] 上操作
+# dim=0 时：x.reshape(M*R, N) 是零拷贝 view，零转置
+```
+
+转置次数对比：
+
+| dim 位置 | 优化前 | 方法 1 | 方法 2 |
+|---------|--------|--------|--------|
+| dim=0 | 2 次（浪费） | **0 次** | **0 次** |
+| dim=last/中间 | 2 次（浪费） | **1 次** | 不适用（N<64 时回退方法 1） |
+
+> **方法 2 的适用条件**：kernel 的并行轴（N）在原始布局中是连续内维，且 N ≥ 向量化对齐要求（通常 64）。当并行轴太窄（如 dim=-1, N=1）时，必须通过转置将正交轴变为连续内维才能向量化，此时只能用方法 1。
+
+---
+
+### 2.12.1 非连续数据归一化（消除 host 侧 reshape 物理拷贝）
+
+**适用场景**：算子输入数据在 GM 中非连续（如 `permute`/`transpose`/`movedim` 后），host 侧用 `reshape(-1)` 或 `.contiguous()` 做物理重排。**不限于 transpose**——任何处理非 contiguous 输入的算子均可能命中。
+
+**约束**：
+- host 侧只算 stride 参数（纯 Python 整数运算），不触发任何物理拷贝
+- stride 作为 `@tilelang.jit` 函数的 Python 参数传入（JIT 编译期常量），**不打包成 GM tensor**（避免额外 GM→UB 搬运）
+- 启用 `AUTO_CV_COMBINE` 时检查生成代码中 `alloc_var` 的定义/使用核归属；确认误分核后再关闭
+- `T.copy` 不暴露 stride 参数：每次只搬一段物理连续的数据
+
+**思路**：把"数据在哪里"的计算从 host 侧 `reshape`（物理拷贝）转移到 kernel 内 `alloc_var` 累加（零拷贝）。host 侧只传地址偏移参数（JIT 编译期常量），kernel 内逐行搬运。
+
+具体使用方法见 [tilelang-api-best-practices/references/api-compute.md §4.10 Stride 参数作为 JIT 编译期常量传入 kernel](../../tilelang-custom-skill/tilelang-api-best-practices/references/api-compute.md#stride-参数作为-jit-编译期常量传入-kernel避免创建-gm-tensor)。
 
 ---
 
@@ -887,6 +1146,473 @@ T.tile.add(data_cal_p2, data_cal_p2, beta_bc)
 | `Broadcast dimension mismatch` | Layer 3 | broadcast 分两步（fill → broadcast） |
 | `StructuralEqual check failed` | Layer 3 | 用 `T.tile.fill` 替代 `T.copy` 做跨维度传递 |
 | 连续 tile 指令结果异常 | Layer 3 | `AUTO_SYNC=False` 时 dst 需交替使用独立 buffer；`AUTO_SYNC=True` 下 in-place 安全 |
+
+---
+
+### 2.14 Host 侧 D2H 消除（输出后处理 NPU 化）
+
+**适用场景**：Host wrapper（`*_run` 函数）中 kernel 输出被 `.cpu()` 拷回 CPU 做后处理（dtype 转换、`torch.where` merge、transpose/reshape 还原），再传回 NPU。大 shape 时 D2H 拷贝 + CPU 计算成为瓶颈。
+
+> **与 §2.12 的区别**：§2.12 消除的是**输入侧**的 `F.pad` / `.contiguous()`（host→kernel 方向）；本节消除的是**输出侧**的 `.cpu()` 后处理（kernel→host 方向）。
+
+#### 识别模式
+
+当 host wrapper 中出现以下模式时，应优化：
+
+```python
+# ❌ 需要优化的模式：kernel 输出拷回 CPU 做后处理
+v, i32 = _run_2d_kernel(x.npu(), ...)
+out_v = v.cpu()                       # D2H：NPU→CPU
+out_i = i32.cpu().to(torch.int64)     # D2H + CPU dtype 转换
+result = torch.where(cond, a, b)      # CPU 上做计算
+result = result.transpose(d, -1).contiguous()  # CPU 上做 transpose
+```
+
+**判断依据**：如果后处理操作（dtype 转换、where merge、transpose、reshape）都能在 NPU 上做，就不应该拷回 CPU。
+
+#### 优化思路
+
+1. **提供双入口**：
+   - `*_run_npu(x_npu, ...)` —— 全 NPU 路径，输入输出都在 NPU，无 `.cpu()` 调用
+   - `*_run(x, ...)` —— 兼容入口，NPU 输入直走 NPU 路径，CPU 输入先 H2D 再走 NPU 路径，最后只 D2H 一次返回结果
+
+2. **把后处理操作移到 NPU**：
+   - dtype 转换：`i32.cpu().to(torch.int64)` → `i32.to(torch.int64)`（NPU 上做）
+   - `torch.where` merge：直接在 NPU tensor 上做（torch.where 自动在 NPU 执行）
+   - `transpose` / `reshape` / `.contiguous()`：在 NPU tensor 上做（NPU 上的 `.contiguous()` 是 DMA，不是 CPU memcpy）
+
+3. **kernel 调用层去掉不必要的 synchronize**：
+   - `_run_2d_kernel` 内部不要 `torch.npu.synchronize()`，让调用方控制同步时机
+
+#### 正确写法
+
+```python
+def op_run_npu(x_npu, dim):
+    """All-NPU path: input on NPU, output stays on NPU."""
+    xt = x_npu.transpose(d, -1).contiguous() if d != ndim - 1 else x_npu
+    # kernel output stays on NPU
+    v, i32 = _run_2d_kernel(x2d, Rows, L, block_R, dtype)
+    out_v = v                           # no .cpu()
+    out_i = i32.to(torch.int64)         # NPU dtype conversion
+    # merge on NPU (torch.where auto-runs on NPU)
+    out_v[:, s:e] = torch.where(take_prev, rmc, v)
+    # transpose back on NPU
+    out_v = out_v.reshape(tshape).transpose(d, -1).contiguous()
+    return out_v, out_i                 # both on NPU
+
+
+def op_run(x, dim):
+    """Compatible wrapper: accepts CPU or NPU tensor."""
+    if x.is_npu:
+        return op_run_npu(x, dim)
+    out_v_npu, out_i_npu = op_run_npu(x.npu(), dim)
+    torch.npu.synchronize()
+    return out_v_npu.cpu(), out_i_npu.cpu()
+```
+
+#### 什么时候不需要优化
+
+- **测试验证路径**：测试中需要 `.cpu()` 拿回结果与 golden 对比，这是必要的 D2H
+- **操作无法在 NPU 做**：极少数操作 torch_npu 不支持，需 D2H 回 CPU 做（此时应在注释说明）
+
+#### 检查清单
+
+- [ ] host wrapper 中 kernel 输出无 `.cpu()` 调用（除最终返回外）？
+- [ ] dtype 转换在 NPU 上做（`.to(dtype)` 不带 `.cpu()`）？
+- [ ] `torch.where` / merge 在 NPU tensor 上做？
+- [ ] transpose / reshape / `.contiguous()` 在 NPU tensor 上做？
+- [ ] 提供了 `*_run_npu` 全 NPU 路径入口？
+- [ ] `*_run` 兼容入口对 NPU 输入直接走 NPU 路径，不冗余 D2H？
+
+---
+
+### 2.15 正交轴向量化（Orthogonal Axis Vectorization）
+
+**适用场景**：
+- 算子存在两层嵌套循环：外层遍历正交轴（如行），内层沿扫描轴逐元素处理
+- 扫描轴有真依赖（如 prefix scan 的 `i` 依赖 `i-1`），无法消除内层循环
+- 正交轴的各元素间无数据依赖，却被写成了串行 `for r`
+- 内层操作是标量（`if`/`GetValue`/`SetValue`），而非 `T.tile` 向量操作
+
+> **与 §2.6 的区别**：§2.6 解决"循环内已经是 tile 操作但逐行串行"（broadcast + 整 tile 消除外层循环）；本节解决"循环内是标量操作且扫描轴有依赖"——需要 transpose + 折叠正交轴 + 用 `T.tile.compare/select/min` 等向量原语替代标量 if-else。
+
+#### 约束判据
+
+满足以下全部条件时适用：
+
+1. **两层嵌套循环**：`for r: for i: scalar_op(a[r,i], v[r,i-1])`
+2. **正交轴独立**：交换 `r` 的迭代顺序不影响结果（`r` 之间无数据依赖）
+3. **扫描轴有依赖**：`i` 依赖 `i-1`，无法直接消除内层循环
+4. **内层是标量操作**：使用 `if`/`GetValue`/`SetValue` 而非 `T.tile` 指令
+
+#### 操作步骤
+
+**Step 1：识别并行轴**
+
+找出被串行化的正交轴。判断方法：交换该轴的迭代顺序，若结果不变则该轴可并行。
+
+**Step 2：使并行轴内存连续**
+
+并行轴的数据在内存中必须连续，否则 `T.copy` stride 访问效率极低。
+
+- 若并行轴已是最内维（如 `[scan, parallel]` layout），直接使用
+- 若并行轴不是最内维（如 `[parallel, scan]` layout），在 host 侧 transpose
+
+```python
+# 优化前：[Rows, L] row-major，取 64 行的同一 L 位置是 stride 访问
+# 优化后：transpose 为 [L, Rows]，同一 L 位置的 64 行内存连续
+x_t = x2d.t().contiguous()  # [L, Rows]
+```
+
+**Step 3：折叠循环为向量操作**
+
+将 `for r: scalar_op(r)` 替换为单次 `T.tile.op([N])`，N 为并行轴元素数。N 需满足 compare 指令的 256B 对齐要求（fp32=64 元素，fp16=128 元素）；并行轴超过 N 时分块，外层循环处理多 chunk。
+
+```python
+# 优化前：逐行逐元素标量扫描
+for r in range(sub_block_R):
+    for i in range(1, L):
+        if a[r, i] <= v[r, i - 1]:
+            v[r, i] = a[r, i]
+            idx[r, i] = i
+        else:
+            v[r, i] = v[r, i - 1]
+            idx[r, i] = idx[r, i - 1]
+
+# 优化后：transpose + 向量操作
+# 数据布局 [L, Rows]，每次处理 N=64 行
+# select 模式按 N 动态选择（见 §2.11 select 模式选择）
+sel_mode = "VSEL_CMPMASK_SPR" if (N <= 64 and not is_int) else "VSEL_TENSOR_TENSOR_MODE"
+for j in range(1, L):
+    T.copy(A[j, col_base:col_base + N], curr_ub)
+    T.tile.compare(mask, curr_cal, run_min_cal, "LE")
+    T.tile.select(run_idx, mask, idx_curr, run_idx, sel_mode)
+    T.tile.min(run_min_cal, run_min_cal, curr_cal)  # 值更新
+```
+
+#### int32 向量化（转 fp32 处理）
+
+int32 **必须**纳入向量化，**不要**按 dtype 回退标量。
+
+**A2/A3 上的 int32 约束**：
+- `T.tile.compare`：int32 **只有 `EQ` 有效**，传 `LT/LE/GT/GE` 会被底层强制退化成 `vcmpv_eq`（`3rdparty/pto-isa/include/pto/npu/a2a3/TCmp.hpp`），结果错误。
+- `T.tile.select`：int32 在 `VSEL_CMPMASK_SPR` 模式下不可用，必须用 `VSEL_TENSOR_TENSOR_MODE`。
+
+**两种方案对比**：
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| EQ 恒等式 | 值/mask 全程 int32，用 `EQ(curr, min(old,curr))` 还原 `<=` | 无精度问题 | int32 compare 只支持 EQ，select 限 tensor 模式，写法复杂 |
+| **转 fp32（推荐）** | int32 cast 为 fp32 后复用 fp 路径（LE compare + select） | 写法统一简单，SPR 模式可用 | `|值| > 2²⁴` 时 fp32 尾数不够 |
+
+**推荐方案：转 fp32**。cummin 的索引恒 < L ≪ 2²⁴，值域通常也在 2²⁴ 内。将 int32 与 fp16/bf16 统一处理：`cal_dtype = "float32"`，`low_prec = dtype in ("float16", "bfloat16", "int32")`，kernel 内先 cast 到 fp32 再走标准 fp 路径。
+
+```python
+low_prec = dtype in ("float16", "bfloat16", "int32")  # int32 也走 cast 路径
+cal_dtype = "float32"
+sel_mode = "VSEL_CMPMASK_SPR" if (N <= 64 and dtype != "int32") else "VSEL_TENSOR_TENSOR_MODE"
+# kernel 内：T.tile.cast(in_cal, in_tile, "CAST_NONE", count) 统一处理
+```
+
+> **何时用 EQ 恒等式方案**：仅当值域可能超过 2²⁴（如 int32 大值累加场景）且不能用 fp32 承载时。此时值/mask 用 int32，索引用 fp32，顺序须**先 min 后 compare**。
+
+> **host 侧 padding**：int32 转置后若需 padding，用 `torch.iinfo(dtype).max` 填充（不能用 `inf`）。
+
+#### NaN 处理（关键子方案）
+
+当操作涉及比较+选择（如 argmin 更新），硬件 compare 指令对 NaN 全返回 False，导致 NaN 位置索引不更新。
+
+**问题**：
+- `LE(NaN, x)` = False → 不更新索引 → **错**（NaN 应成为新最小值，索引应更新）
+- `LE(x, NaN)` = False → 不更新索引 → **对**（NaN 已赢了，索引保持）
+
+**解法：`EQ(curr, curr)` 自比较检测 NaN**
+
+硬件 `EQ` 对 NaN 也返回 False（`EQ(NaN, NaN)` = False），而正常值和 inf 返回 True。利用这一点：
+
+```python
+# 值更新：T.tile.min 自动正确传播 NaN
+T.tile.min(run_min_cal, run_min_cal, curr_cal)
+
+# 索引更新：两个 select 串联（sel_mode 按 N 选择，见 §2.11）
+T.tile.compare(mask_le, curr_cal, run_min_cal, "LE")       # 正常比较
+T.tile.compare(mask_nan, curr_cal, curr_cal, "EQ")          # NaN 检测
+T.tile.select(run_idx, mask_le, idx_curr, run_idx, sel_mode)
+# Step 2: self_eq=True(normal/inf)->keep step1, False(NaN)->j
+T.tile.select(run_idx, mask_nan, run_idx, idx_curr, sel_mode)
+```
+
+**编译期 has_nan 分路（性能优化）**
+
+NaN 处理比无 NaN 路径多 2 条向量指令（NaN 自比较 + 修正 select）。绝大多数输入没有 NaN，这 2 条指令是白跑的。host 侧用 `torch.isnan(x).any()` 检测，结果作为 JIT 编译期常量 `has_nan` 传入，编译两个版本：
+
+```python
+# host 侧
+has_nan = bool(torch.isnan(x_LR).any())  # int32 恒 False
+
+# kernel 内编译期分路（has_nan 是 JIT 常量，零运行时开销）
+if has_nan:      # 慢路径 6 op：LE compare + EQ self compare + 2 select + min + fill
+    T.tile.compare(mask_le, curr, run_min, "LE")
+    T.tile.compare(mask_nan, curr, curr, "EQ")
+    T.tile.select(run_idx, mask_le, idx_curr, run_idx, sel_mode)
+    T.tile.select(run_idx, mask_nan, run_idx, idx_curr, sel_mode)
+    T.tile.min(run_min, run_min, curr)
+else:            # 快路径 4 op：LE compare + select + min + fill
+    T.tile.compare(mask_le, curr, run_min, "LE")
+    T.tile.select(run_idx, mask_le, idx_curr, run_idx, sel_mode)
+    T.tile.min(run_min, run_min, curr)
+```
+
+**关键正确性**：
+- **inf 走快路径也正确**（inf 是有序值，`min`/`compare` 正常处理），所以只有真正的 NaN 才需要走慢路径
+- **int32 恒走快路径**（无 NaN，`has_nan = False`）
+- `torch.isnan` 不含 `isinf`，不会把 inf 误判为需要慢路径
+
+#### 硬件能力前置检查
+
+| 检查项 | 要求 | 不满足时的处理 |
+|--------|------|---------------|
+| compare 对齐 | 256B（fp32=64 元素，fp16=128 元素） | 分块，外层循环处理多 chunk |
+| select dtype（索引） | fp16/bf16/fp32 可用；int32 索引改用 fp32 承载 | 索引 < L ≪ 2²⁴，fp32 无损 |
+| int32 compare | 仅 `EQ` 有效（`LT/LE/GT/GE` 退化成 eq） | 转 fp32 处理（推荐），或用 EQ 恒等式 |
+| int32 select | SPR 模式不可用 | 用 tensor 模式，或转 fp32 后用 SPR |
+| mask 布局 | bit-packed（1 byte = 8 元素），非 1 byte/元素 | 不影响使用，调试时注意解析 |
+| NaN compare | LT/LE/GT/GE/NE/EQ 对 NaN 全返回 False | 用 `EQ(curr, curr)` 自比较检测 NaN |
+| NaN 性能 | NaN 路径多 2 条指令/步 | 用 `has_nan` 编译期分路，无 NaN 时走 4 op 快路径 |
+
+> **int32 索引 select 的正确用法**：int32 compare 用 `EQ` 产出的 mask，可被 fp32 索引 select 正确消费（mask 内容正确即可，与生成 dtype 无关）。因此 int32 走"值/mask 用 int32、索引用 fp32"即可，见上"int32 向量化"子方案；不要因担心"类型不匹配"而回退标量。
+
+#### 回退机制
+
+向量化路径应与标量路径并存，作为不满足约束时的兜底。int32 通过 EQ 恒等式已纳入向量化，无需按 dtype 排除：
+
+```python
+if use_vectorized:
+    # fp16/bf16/int32 统一 cast 到 fp32：LE compare + select + min
+    # 有 NaN 时额外加 EQ self compare + 修正 select（has_nan 编译期分路）
+    v, i32 = _run_vec_kernel(x2d, Rows, L, dtype, has_nan)  # 向量化路径
+else:
+    v, i32 = _run_2d_kernel(x2d, Rows, L, block_R, dtype)  # 标量路径
+```
+
+> 多核并行分配参考 §2.9 Fixed Core 模式。
+
+#### 检查清单
+
+- [ ] 正交轴各元素间确实无数据依赖？
+- [ ] 并行轴数据在内存中连续（必要时 host 侧 transpose）？
+- [ ] N 满足 256B 对齐（不足时分块）？
+- [ ] select 模式按 N 动态选择（N≤64 且非 int32 → SPR，否则 tensor）？见 §2.11
+- [ ] int32 已转 fp32 处理（推荐），或用 EQ 恒等式？未回退标量？
+- [ ] NaN 用 `EQ(curr, curr)` 自比较检测，值用 `T.tile.min` 传播？
+- [ ] has_nan 编译期分路：无 NaN 走 4 op 快路径，有 NaN 走 6 op 慢路径？
+- [ ] 向量化路径与标量路径并存，host 侧按需选择？
+
+---
+
+### 2.16 特定 dtype 的硬件指令适配（Dtype-Specific Hardware Path Adaptation）
+
+**适用场景**：算子声明支持的 dtype 命中目标 tile 指令的非硬件路径，并且基线或生成
+代码证明该路径是实际瓶颈。以 `T.tile.transpose` 为例，检查
+`src/tl_templates/ascend/common.h` 中对应 `Transpose` 模板分支，不依赖容易漂移的固定行号。
+
+> 也适用于其他 `T.tile.xxx` 指令 + 不支持 dtype 的组合，判断准则一致：先到 `common.h` 确认该指令的模板分支条件，再按本节候选路线选择处理方案。
+
+**识别方法（两步，缺一不可）**：
+
+**第一步：分支条件分析法**。按 `Transpose` 符号定位
+`src/tl_templates/ascend/common.h` 中目标 tile 指令的 C++ 模板分支，列出当前算子所
+支持 dtype 的路径归属，不依赖固定源码行号。
+
+| 分支 | 条件 | 命中 dtype | 路径 |
+|------|------|-----------|------|
+| 1（最优） | `sizeof(T)==2 && !bfloat16_t && M==N==16` | float16, int16 | `AscendC::Transpose` |
+| 2（硬件） | `(sizeof(T)==2 \|\| sizeof(T)==4) && !bfloat16_t && M%16==0 && N%16==0` | float16, int16, float32, int32 | `transpose_block`（TransDataTo5HD） |
+| 3（标量回退） | else | **bfloat16, int8, int64** | `SetValue` 逐元素 |
+
+从表中可直接看出：**标量回退的 dtype 有 3 个**（bfloat16、int8、int64）。bfloat16 虽然 `sizeof==2`，但被 `!std::is_same_v<T, bfloat16_t>` 显式排除；int8（`sizeof==1`）和 int64（`sizeof==8`）因不满足 `sizeof==2 || sizeof==4` 而回退。
+
+> 只检查算子规格实际支持且受当前修改影响的 dtype；不得要求只支持一种 dtype 的算子
+> 顺带实现其他 dtype。每条候选路线仍需单独验证正确性和收益。
+
+> **UB 内 M/N 一定是 block 对齐**：使用 block 端点 + `T.tile.fill` 清零方案时，copy 到 UB 的始终是完整的 `[block_M, block_N]`（编译期常量，如 128×128），一定是 16 的倍数。因此分支条件中的 `M%16==0 && N%16==0` 自动满足，前端无感，不需要考虑"M/N 非 16 倍数导致标量回退"的情况。
+
+**第二步：`get_kernel_source()` 验证**。对每个 dtype 编译 kernel 并检查生成代码中是否出现 `SetValue`（标量回退标志）。这一步用于验证第一步的分析结论，特别是当 common.h 的分支条件复杂或经过多轮 lowering 时。
+
+**候选路线（按 dtype 逐一对应，详见 [api-compute.md §4.10](../../tilelang-custom-skill/tilelang-api-best-practices/references/api-compute.md#ttiletranspose-的-dtype-支持与标量回退)）**：
+
+| dtype | 处理方案 | 核心思路 | 关键约束 |
+|-------|---------|---------|---------|
+| **bfloat16** | host 侧 `view(int16)` 零拷贝 reinterpret | bfloat16 与 int16 均 2 字节，transpose 只搬数据不改 bit pattern，可安全 reinterpret | 零开销，不需额外 UB buffer；**这是首选方法** |
+| **int8** | kernel 内 `T.tile.cast` 到 float16 | int8 无同宽硬件 dtype，需 cast 到 float16 后用硬件指令 | 需额外 cal_dtype UB buffer；cast 用 `CAST_NONE`（low→high）/`CAST_RINT`（high→low）；**禁止 host 侧 `.to()` 转换** |
+| **int64** | 路线 B：块 DMA + UB-local 标量 lowering | GM 两侧块 DMA，`T.tile.transpose` 的标量 lowering 限制在 UB 内，禁止逐元素 strided GM 访问 | **不做类型转换**（cast 会丢失高位）；优先 record-aware DMA（路线 A），不满足时用路线 B；标量 lowering 在 UB 内是正确方案，不是"需要消除的标量回退" |
+
+> **int64 路线 B 是正确方案，不是"接受标量回退"**：路线 B 的核心是 GM 两侧用块 DMA（`T.copy` 搬运完整 `[block_M, block_N]`），`T.tile.transpose` 的标量 lowering 只发生在 UB 内部。这与"逐元素 strided GM load/store"（path3 的逐元素 DMA）有本质区别——前者把慢路径限制在 UB，后者直接在 GM 上逐元素操作。若实测路线 B 没有比 baseline 更快，应标为"不适用/无收益"，但不能为了消除 `SetValue` 强制改成逐元素短 DMA。
+
+> **int64 的两条路线**（详见 [api-compute.md "int64 正确实现路线"](../../tilelang-custom-skill/tilelang-api-best-practices/references/api-compute.md#int64-正确实现路线不做类型转换优先聚合-dma否则保留-ub-local-fallback)）：
+> - 路线 A（record-aware DMA）：输入/输出存在共同连续 suffix record，且 `record_bytes = record_len * 8 ≥ 32`，单次地址/长度/gap 满足 DataCopy 约束时使用。
+> - 路线 B（块 DMA + UB-local）：通用 fallback。`T.tile.transpose(b_ub, a_ub)` 标量 lowering 局限在 UB，GM 两侧仍是块 DMA。
+
+> **DataCopy 前置条件**：逐行/record 搬运只有在该连续段本身就是正确输出单位，且地址、单次字节数和 gap 满足当前后端 DataCopy 要求时才成立。尤其 `record_len * dtype_bytes < 32`（如单个 int64 为 8B）时，不能把每个 record 单独 `T.copy` 当作通用方案；应聚合多个相邻 record 使单次搬运达到合法粒度，或回到块 DMA + UB-local reorder。尾块必须用显式 valid extent。
+
+> **⚠️ 禁止在 host 侧做 dtype 转换/拆分来绕过标量回退**：`x.to(torch.int16)` 触发 `aclnnCast`、`.contiguous()` 触发 `aclnnCopy`、`torch.stack` 触发 `aclnnCat`。int32 lane 拆分只有在 kernel 内提取/交织语义和 UB planner 已经端到端验证时才是实验候选，不是默认路线。
+
+#### 检查清单
+
+- [ ] 已对算子规格实际支持且受本次修改影响的 dtype 分析 `common.h` 模板分支？
+- [ ] 已用 `get_kernel_source()` 验证每个标量回退 dtype 的生成代码中确实出现 `SetValue`？
+- [ ] bfloat16 是否已用 host 侧 `view(int16)` 零拷贝 reinterpret？
+- [ ] int8 是否已用 kernel 内 `T.tile.cast` 到 float16？（禁止 host 侧 `.to()` 转换）
+- [ ] int64 是否已用路线 B（块 DMA + UB-local 标量 lowering）？GM 两侧是否为块 DMA 而非逐元素 strided GM？
+- [ ] 每次 DataCopy 是否满足连续段、最小粒度、地址/gap 和显式尾块 valid extent？
+- [ ] int64 是否用高 32 位非零数据验证 bit-exact，并在同步后确认无 ACL/AICore 错误？
+- [ ] 是否运行了该优化影响的全部 canonical cases，而非只跑 profiling subset？
+- [ ] host 侧是否有 `.to(dtype)` / `.contiguous()` / `torch.stack` 等触发 aclnn 的操作？（有则必须移入 kernel）
+
+---
+
+### 2.17 离散重排 fallback 的多阶段连续化
+
+**适用场景**：layout transform / transpose 的通用 fallback 因连续
+`record_len` 很短而产生大量离散 GM 访问；目标 permutation 可以分解成有限个相邻
+连续轴组 rotation，每个 stage 可改为块 DMA + UB-local transpose。
+
+这是对 kernel 内离散 fallback 的优化，不属于 §2.12 的 host `.contiguous()` 消除。
+full reversal 只是可能命中的一种 permutation，不是启用条件。
+
+#### 实施顺序：先证明 stage kernel，再写 planner
+
+不得先写 rotation planner 并直接复用现有 path1 kernel。单 stage case 通过不能证明
+该 kernel 能安全处理多 stage 产生的多 batch、双尾块和 `M/N < tile`。
+
+识别本优化点时，先在 Part A 输出 `[KERNEL-REUSE-PRECHECK]`；不能从当前代码证明
+stage kernel 满足下列维度时，候选方案应写成“先修复/新建 stage kernel，再实施
+planner”，不能写“直接复用 path1”。进入 Step 4 后，在修改 dispatch 前再次输出：
+
+```text
+[KERNEL-REUSE-AUDIT]
+stage table: [(batch, M, N), ...]
+tile: true/false + 推导
+core: true/false + physical_core_num/single_core_load
+tail: true/false + 输入/输出 BufferRegion
+multibatch: true/false + 非整除时的 batch 边界证明
+specialization: true/false + dtype 静态 UB 变体
+```
+
+任一项为 false/unknown 时，先新建或修复 stage kernel，不得接入 planner。
+
+#### 为什么“标量 GM 起点 + 完整 tile”会跨 batch
+
+设 stage 输入声明为 `x[batch, M, N]`。下面的写法没有把当前 batch 的合法二维区域
+传给 `T.copy`：
+
+```python
+# 错误
+a_ub = T.alloc_ub((block_M, block_N), dtype)
+T.copy(x[b, m_start, n_start], a_ub)
+```
+
+当 `M=11`、`N=13`、`block_M=block_N=128` 时，一个 batch 只有 `11*13=143`
+个元素，而完整 UB tile 有 `128*128=16384` 个元素。标量起点之后的搬运范围远超
+当前 batch 的 143 个元素，会继续覆盖后续 batch 的物理地址。输出侧若同样使用
+`T.copy(full_ub, y[b, n_start, m_start])`，还会把完整 tile 写入后续 batch。
+因此污染在大 batch 下被重复放大；全 NaN 输入看不出来，稀疏 NaN mask 会直接错位。
+
+这不是 rotation 的轴顺序错误，也不能通过减少物理核数修复。fixed-core 只解决任务
+调度，无法改变每个 task 的非法搬运范围。正确写法必须让 GM 两侧显式携带当前 tile
+的二维 BufferRegion：
+
+```python
+T.copy(
+    x[b,
+      m_start:m_start + block_M,
+      n_start:n_start + block_N],
+    a_ub,
+)
+T.tile.transpose(b_ub, a_ub)
+T.copy(
+    b_ub,
+    y[b,
+      n_start:n_start + block_N,
+      m_start:m_start + block_M],
+)
+```
+
+只有在当前 lowering 已验证会按 tensor 边界裁剪上述 BufferRegion 时才能使用该
+有界 block 端点；否则显式计算 `valid_m/valid_n`，并对 GM 与 UB 两侧都使用有效
+切片。禁止只修输入侧或只修输出侧。
+
+#### 正确的 stage kernel 契约
+
+1. 为每个 stage 基于当前 `M/N`、dtype、静态指令对齐和 UB buffer 总量重新选 tile；
+   不能所有 stage 固定 `128×128`。tile 可以大于尾块，但其静态 shape 必须满足指令
+   对齐且 UB 不超限。
+2. 逻辑任务数与物理核数分离：
+
+```python
+logical_tasks = batch * ceildiv(M, block_M) * ceildiv(N, block_N)
+core_num = max(1, min(logical_tasks, vector_core_count))
+single_core_load = ceildiv(logical_tasks, core_num)
+```
+
+3. kernel 使用 `T.Kernel(core_num)`，每核用 `T.serial(single_core_load)` 覆盖逻辑
+   task；输入和输出 GM 两侧都必须是 BufferRegion：
+
+```python
+with T.Kernel(core_num, is_npu=True) as (cid, vid):
+    a_ub = T.alloc_ub((block_M, block_N), dtype)
+    b_ub = T.alloc_ub((block_N, block_M), dtype)
+    for t in T.serial(single_core_load):
+        task = cid * single_core_load + t
+        if task < logical_tasks:
+            n_blk = task % n_blocks
+            m_blk = (task // n_blocks) % m_blocks
+            b_idx = task // (n_blocks * m_blocks)
+            T.copy(
+                x[b_idx,
+                  m_blk * block_M:(m_blk + 1) * block_M,
+                  n_blk * block_N:(n_blk + 1) * block_N],
+                a_ub,
+            )
+            T.tile.transpose(b_ub, a_ub)
+            T.copy(
+                b_ub,
+                y[b_idx,
+                  n_blk * block_N:(n_blk + 1) * block_N,
+                  m_blk * block_M:(m_blk + 1) * block_M],
+            )
+```
+
+需要 cast 的 dtype 使用独立静态 JIT 变体；不得在 TIR 内条件分配可能未定义或动态
+shape 的 UB。没有合法硬件 transpose 路线的 dtype 不强制进入本优化。
+
+#### planner 与逐步验证
+
+planner 每轮必须从更新后的 `cur_shape/cur_axes` 计算 `batch/M/N`，输出本轮 stage
+表，并在最后断言 axes 等于目标 permutation。接入 dispatch 前先单独验证 stage
+kernel 的以下形态：
+
+- `batch > 1` 且 M/N 都非 tile 整除；
+- `M < block_M`、`N < block_N`；
+- 输入和输出同时存在尾块；
+- 最大 batch 和最大逻辑任务数。
+
+接入 planner 后立即运行所有受影响 canonical cases，特殊浮点值使用“有限值 +
+稀疏 NaN”并严格比较 NaN mask。精度失败时停止本优化，不能继续下一个优化点，也
+不能用旧轮报告或 fallback 路径的通过结果填写当前 `[RESULT]`。
+
+#### 必须规避
+
+- `T.Kernel(logical_tasks)` 直接按逻辑 tile 数启动。
+- `T.copy(x[b, m_start, n_start], full_ub)` 这类标量 GM 起点写法。
+- 认为 fixed-core 可以修复越界/跨 batch；它只改变任务分配，不改变单 task 搬运范围。
+- 只在输入侧添加 BufferRegion，输出仍按完整 UB 写回，或反过来。
+- 所有 stage 固定相同 tile。
+- planner 正确就假定被复用 kernel 也正确。
+- 只验证最终 shape/axes，不验证各 stage 尾块和 batch 边界。
+- 优化失败后静默回退，却报告该优化精度通过或性能有收益。
+
+无端到端收益时保留正确 fallback，并将本优化记录为“不适用/无收益”。
 
 ---
 

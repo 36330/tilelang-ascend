@@ -50,7 +50,7 @@ from .allocate import (
     alloc_L1,  # noqa: F401
     alloc_ub,  # noqa: F401
 )
-from .copy import copy, c2d_im2col, npu_copy_v2 as copy  # noqa: F401, F811
+from .copy_op import copy, c2d_im2col, npu_copy_v2 as copy  # noqa: F401, F811
 from .gemm import GemmWarpPolicy, gemm  # noqa: F401
 
 # from .fill import fill, clear  # noqa: F401
@@ -80,7 +80,8 @@ from .builtin import *  # noqa: F401
 
 from .memscope import *  # noqa: F401
 
-from .ascend import *
+from .ascend import *  # noqa: F401, F403
+from .ascend import _src_code  # explicit export: underscore names not in *  # noqa: F401
 from .reduce_ascend import *  # noqa: F401, F403
 from . import ascend_tile as tile  # noqa: F401
 
@@ -170,32 +171,6 @@ def annotate_padding(padding_map: Dict):
 def import_source(source: str | None = None):
     # source is the source code to be imported
     return block_attr({"pragma_import_c": source}) if source is not None else None
-
-
-def init_flag(fmap):
-    inst = ""
-    for src, d in fmap.items():
-        for dst, stages in d.items():
-            for stage in stages:
-                inst += f"AscendC::SetFlag<AscendC::HardEvent::{src}_{dst}>({stage});\n"
-
-    return attr(None, "init_flag", inst)
-
-
-def clear_flag(fmap):
-    inst = ""
-    for src, d in fmap.items():
-        for dst, stages in d.items():
-            for stage in stages:
-                inst += f"AscendC::WaitFlag<AscendC::HardEvent::{src}_{dst}>({stage});\n"
-
-    @macro
-    def _get_inst():
-        with attr(None, "clear_flag", inst):
-            call_extern("handle", "...")
-
-    # return attr(call_extern("handle", "..."), "clear_flag", inst)
-    return _get_inst()
 
 
 def npu_use_swizzle(cid, m, n, k, block_m, block_n, off=1, dir=0, in_loop=False):

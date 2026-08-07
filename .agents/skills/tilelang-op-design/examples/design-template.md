@@ -20,6 +20,10 @@ $$
 
 {对于多步算子，描述计算步骤的分解逻辑。单步算子可省略。}
 
+> **⚠️ Host 侧 Buffer 操作约束**（详见 ../references/ascend-constraints.md §5）：host 侧只允许经证明共享
+> 原 storage、只改 metadata 的 view 操作，以及 kernel 调用和验证；禁止真实数据搬运
+> 和 aclnn 计算。`reshape` 需按目标 shape/stride 证明零拷贝。
+
 ### 1.5 数据流图
 
 ```
@@ -218,6 +222,19 @@ block_num = (M // block_M) * (N // block_N)
 
 {非整除情况的处理策略、边界块的特殊逻辑等}
 
+> **⚠️ 非整除必须显式设计**（详见 ../references/ascend-constraints.md §5）：输入、输出 GM 两侧使用
+> `valid_*` extent 的 BufferRegion，前端按动态切片裁剪搬运。不得使用标量 GM 起点配
+> 完整 UB tile；host 侧不允许 padding + crop。
+
+### 5.5 数据搬运性能可行性（数据重排算子必填）
+
+| 结构/dtype 路径 | 代表性最大 case | GM pass | DMA 数/平均字节 | GM 标量访问 | 地址 div/mod | AIV 并行度 | 结论 |
+|-----------------|-----------------|---------|------------------|-------------|--------------|------------|------|
+| {通用 fallback} | {shape, dtype} | {次数} | {数量/字节} | {数量} | {数量} | {core/串行任务} | {可行/需重设计} |
+
+> 大张量主路径禁止逐元素 strided GM 访问。若输入/输出共享连续 suffix record，
+> 应按结构谓词设计 record-aware 二维/成组搬运，不得按具体 perm/shape 写死分支。
+
 ---
 
 ## 6. 循环与调度结构
@@ -245,6 +262,10 @@ with T.Kernel(block_num, is_npu=True) as (cid, vid):
 ### 6.4 尾块处理
 
 {当输入 shape 不能被 block size 整除时的处理策略}
+
+> **⚠️ 尾块必须显式设计**（详见 ../references/ascend-constraints.md §5）：输入、输出 GM 两侧都使用
+> `valid_*` extent 的 BufferRegion；前端按这些动态切片裁剪搬运。不得用标量 GM
+> 起点配完整 UB tile，也不得在 host 侧 padding + crop。
 
 ---
 
@@ -289,7 +310,7 @@ pass_configs = {
 - `T.Kernel(block_num, threads=2, is_npu=True) as (cid)`（单轴 + `threads=2`）
 - 装饰器无 `workspace_idx`，签名无 `workspace_*` 参数
 - Cube↔Vector 改片上 `alloc_shared/alloc_fragment` 直连，中转/同步交给四个 pass
-- 模板见 [tilelang-expert-to-developer mode-examples.md §6](../../tilelang-custom-skill/tilelang-expert-to-developer/references/mode-examples.md#6-cv-融合--推荐写法消除-workspace--vidthreads2)
+- 模板见 [tilelang-programming-model-guide mode-examples.md §6](../../tilelang-custom-skill/tilelang-programming-model-guide/references/mode-examples.md#6-cv-融合--推荐写法消除-workspace--vidthreads2)
 
 **Expert / 混合 / Developer 复杂场景回退**：填写 workspace 表——
 
@@ -305,8 +326,8 @@ pass_configs = {
 ```python
 # Developer（推荐）：Cube 输出直连片上 buffer，无 workspace
 T.copy({输入}, {buffer})
-T.gemm_v0({a}, {b}, {c}, transpose_B={True/False})
-T.copy({c}, {vector_side_buffer})       # L0C → alloc_shared 直连
+T.gemm_v0({a}, {b}, {c}, transpose_B={True / False})
+T.copy({c}, {vector_side_buffer})  # L0C → alloc_shared 直连
 
 # 回退（Expert/混合）：经 workspace 中转
 # T.copy({c}, workspace_1[cid, :, :])
@@ -327,10 +348,10 @@ T.copy({output}, Output[...])           # 输出
 
 ```python
 pass_configs = {
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: {True/False},  # 自动 CV 分离
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: {True/False},     # 自动核间同步
-    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: {True/False},        # 自动同步
-    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: {True/False},  # 内存规划
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: {True / False},  # 自动 CV 分离
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_SYNC: {True / False},  # 自动核间同步
+    tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: {True / False},  # 自动同步
+    tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: {True / False},  # 内存规划
 }
 ```
 
@@ -364,12 +385,32 @@ def golden_{算子名}({参数}):
 
 ### 9.3 精度标准
 
-> L0 用 baseline 标准即可；L1/L2/Boundary 扩展时由 `tilelang-op-test-design` 按算子类别（GEMM / Softmax / Normalization / Activation / Reduction / Fusion）套用更细的精度标准。
+> 采用**混合容差**：逐元素 `|actual-golden| ≤ atol + rtol·|golden|`，整体判定 `matched_ratio ≥ required_matched_ratio` **且** `max_abs_error ≤ max_abs_error_limit`。
+> 阈值**仅按 dtype**（与算子类别无关），L0/L1/Boundary 套用精度比对（L2 为非法输入负向测试，不比精度）；整型按 0 误差精确匹配。完整定义见 `tilelang-op-test-design/references/precision-standard.md`。
+>
+> **特殊浮点值的位置契约**：若算子支持 NaN/Inf，测试输入使用有限值与稀疏特殊值
+> 混合的确定性数据，并保证至少存在一个特殊值和一个有限值。比较时先分别严格检查
+> `isnan`、正 Inf、负 Inf mask 完全一致，再仅对双方均为有限值的位置应用上面的
+> 混合容差。全 NaN/全 Inf 输入可作为补充边界用例，但不能作为唯一特殊值测试；
+> `allclose(equal_nan=True)` 不能替代显式 mask 检查。
 
-| dtype | atol | rtol |
-|-------|------|------|
-| float16 | 1e-2 | 1e-2 |
-| float32 | 1e-4 | 1e-4 |
+| dtype | atol | rtol | max_abs_error_limit | required_matched_ratio |
+|-------|------|------|---------------------|------------------------|
+| float16 | 2⁻¹⁴ (6.10e-5) | 2⁻⁹ (1.95e-3) | 1e-1 | 0.99 |
+| bfloat16 | 2⁻¹⁰ (9.77e-4) | 2⁻⁶ (1.56e-2) | 1e0 | 0.99 |
+| float32 | 2⁻¹⁶ (1.53e-5) | 2⁻¹⁰ (9.77e-4) | 1e-2 | 0.99 |
+| int8/16/32, uint8 | 0 | 0 | 0 | 1.0（精确匹配） |
+
+> 上表按本算子 **§4 数据规格实际支持的 dtype** 填写，未支持的行删除；有额外 dtype（hifloat32 / float8_e4m3 / float8_e5m2 等）按 `precision-standard.md §二` 补齐。§4 声明的每个 dtype 都应在表中有对应行（浮点给 atol/rtol/max_abs_error_limit/required_matched_ratio，整型为 0/0/0/1.0）。
+
+### 9.4 性能可行性哨兵（强制执行，不可因 large/L1 跳过）
+
+| 用例名 | Shape | dtype/属性 | 覆盖路径 | 单 case timeout | 选择理由 |
+|--------|-------|------------|----------|-----------------|----------|
+| {perf_worst_path} | {最大/关键 shape} | {最坏 dtype} | {结构路径} | {秒} | {最大 DMA/标量任务数} |
+
+测试数据、随机数、特殊值和 golden 物理重排均在 CPU 完成；运行阶段只做
+H2D → TileLang kernel → D2H，避免测试 harness 引入 aclnn 依赖。
 
 ---
 
@@ -398,9 +439,11 @@ def golden_{算子名}({参数}):
 
 ```
 examples/{算子名}/
-├── example_{算子名}.py     # 算子实现 + 简单测试
-├── design.md               # 本设计文档
-└── README.md               # 使用说明（可选）
+├── {算子名}.py            # 纯 kernel（@tilelang.jit，可 import，无 golden/测试/__main__）
+├── test_{算子名}.py       # from {算子名} import kernel + golden + 分层测试 + main
+├── proto.yaml             # 算子接口规格（dtype/attr），供覆盖门禁派生应覆盖维度
+├── design.md              # 本设计文档
+└── README.md              # 使用说明（可选）
 ```
 
 ### 11.2 文件清单
@@ -408,20 +451,47 @@ examples/{算子名}/
 | 文件 | 状态 | 说明 |
 |------|------|------|
 | `design.md` | {已完成} | 设计文档 |
-| `example_{算子名}.py` | {待实现} | 算子实现 |
-| `test_{算子名}.py` | {待实现} | 测试文件（可选，放入 testing/） |
+| `proto.yaml` | {已完成} | 算子接口规格（dtype 全集取自 §9.3 精度表、attr 取自 §4/§1，机械派生），覆盖门禁 `coverage_check.py --proto` 用 |
+| `{算子名}.py` | {待实现} | 纯 kernel（@tilelang.jit） |
+| `test_{算子名}.py` | {待实现} | golden + 分层测试 + main（`from {算子名} import {算子名}`） |
 
 ### 11.3 命名规范
 
 - 目录名: `{算子名}`（snake_case）
-- 实现文件: `example_{算子名}.py`
-- 测试文件: `test_{算子名}.py`
+- kernel 文件: `{算子名}.py`
+- 测试文件: `test_{算子名}.py`（顶部 `from {算子名} import {算子名}`）
 
 ### 11.4 实现顺序
 
-1. ✅ 设计文档（design.md）+ L0 门槛测试计划（本文件 §9.2）
-2. ⬜ Golden 函数（验证基准）
-3. ⬜ 算子实现（example_{算子名}.py）+ 内嵌 L0 用例
+1. ✅ 设计文档（design.md）+ **proto.yaml（算子接口规格）** + L0 门槛测试计划（本文件 §9.2）
+2. ⬜ kernel 实现（`{算子名}.py`，纯 @tilelang.jit）
+3. ⬜ 测试文件（`test_{算子名}.py`）：import kernel + Golden 函数 + L0 用例 + main
 4. ⬜ L0 门槛测试通过（精度收敛）
 5. ⬜ 扩展分层套件（L1 功能 / L2 异常 / Boundary 特殊值，由 `tilelang-op-test-design` 场景 B 生成）
 6. ⬜ 全量套件运行（L0/L1 须通过；L2/Boundary 失败仅记录不阻塞）
+
+### 11.5 算子 proto.yaml（覆盖门禁用，Stage 1 产出）
+
+> **dtype 全集取自本文档 §9.3 精度表**（每个支持的 dtype 一行；§4.1 输入张量只填代表性 dtype，不作 dtype 全集来源）+ **§4/§1** 的 attr/shape 机械派生，是覆盖门禁 `coverage_check.py --proto` 的**权威 dtype/attr 来源**——**每个算子都产出**，保证覆盖门禁始终能强制"每个支持的 dtype / 每个关键 attr 都测到"。checker 只读 `operator.inputs[].dtype` 与 `operator.attrs[].name`。
+
+```yaml
+operator:
+  name: {算子名}                       # 如 Softmax
+  category: {算子类别}                 # GEMM / Softmax / Normalization / Activation / Reduction / Fusion
+  formula: |
+    {数学公式}
+  attrs:                              # 影响计算路径的属性；无则写 []
+    - name: {attr名}                  # 如 dim
+      type: {Int/Float/Bool/Enum}
+      default: {默认值}
+      required: {true/false}
+  inputs:
+    - name: {输入名}                   # 如 x
+      dtype: [{支持的 dtype 列表}]      # 如 [float16, float32, bfloat16]
+  outputs:
+    - name: {输出名}
+      dtype: [{支持的 dtype 列表}]
+  schema: {函数签名}                   # 如 softmax(Tensor x, int dim=-1) -> Tensor y
+```
+
+> **一致性约束**：`inputs[].dtype` 必须与 **§9.3 精度表**的 dtype 行一致（全集；不要只取 §4.1 的代表性 dtype，否则覆盖门禁只会要求测那一个）；`attrs[].name` 必须覆盖所有影响计算路径的属性（供 `D-PARAM-*` 覆盖维度派生）。
