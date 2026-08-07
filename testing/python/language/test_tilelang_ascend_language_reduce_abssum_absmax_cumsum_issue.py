@@ -203,9 +203,7 @@ def phase1_passes(target: tvm.target.Target):
         ("LowerTileOp", lambda m: tilelang.transform.LowerTileOp()(m)),
         (
             "AscendTailMaskPropagation",
-            lambda m: tilelang.transform.AscendTailMaskPropagation(
-                rewrite_reduce=target.model in {"ascendc", "pto", "auto"}
-            )(m),
+            lambda m: tilelang.transform.AscendTailMaskPropagation(rewrite_reduce=target.model in {"ascendc", "pto", "auto"})(m),
         ),
         ("AscendWorkspaceReduction", lambda m: tilelang.transform.AscendWorkspaceReduction()(m)),
         ("LegalizeVectorizedLoop", lambda m: tilelang.transform.LegalizeVectorizedLoop()(m)),
@@ -230,15 +228,11 @@ def phase2_passes(target: tvm.target.Target, platform: str):
         ("tir.Simplify before VectorizeLoop", lambda m: tir.transform.Simplify()(m)),
         (
             "VectorizeLoop",
-            lambda m: tilelang.transform.VectorizeLoop(
-                enable_vectorize=allow_vectorize(pass_ctx=pass_ctx)
-            )(m),
+            lambda m: tilelang.transform.VectorizeLoop(enable_vectorize=allow_vectorize(pass_ctx=pass_ctx))(m),
         ),
         (
             "AscendStorageRewrite",
-            lambda m: tilelang.transform.AscendStorageRewrite(
-                is_npu=check_npu_availability()
-            )(m),
+            lambda m: tilelang.transform.AscendStorageRewrite(is_npu=check_npu_availability())(m),
         ),
         ("tir.UnrollLoop", lambda m: tir.transform.UnrollLoop()(m)),
         ("tir.RenormalizeSplitPattern", lambda m: tir.transform.RenormalizeSplitPattern()(m)),
@@ -439,20 +433,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-
-
-
 # import tilelang
 # from tilelang import language as T
-
 
 
 # # op_name, target =  "reduce_abssum", "ascendc"
 # # op_name, target =  "reduce_absmax" ,"ascendc"
 # op_name, target =  "cumsum" ,"ascendc"
-
-
-
 
 
 # def make_reduce_kernel():

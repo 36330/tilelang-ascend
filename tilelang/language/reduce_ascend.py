@@ -10,7 +10,8 @@ from .ascend import _dtype, _get_tmp_arena_access_ptr, _retrieve_shape
 
 _REDUCE_KWARG_SENTINEL = object()
 
-__all__ = ["reduce","reduce_sum","reduce_max","reduce_min", "reduce_abssum", "reduce_absmax","cumsum"]
+__all__ = ["reduce", "reduce_sum", "reduce_max", "reduce_min", "reduce_abssum", "reduce_absmax", "cumsum"]
+
 
 def _get_buffer_extent(object: Buffer | BufferRegion) -> list[int]:
     return list(_retrieve_shape(object))
@@ -475,6 +476,7 @@ def reduce_sum(
     legalized_dim = _legalize_reduce_dim(_get_buffer_extent(buffer), dim)
     return _reduce_with_clear(buffer, out, "reduce_sum", legalized_dim, parsed_clear, parsed_real_shape)
 
+
 def reduce_abssum(
     buffer: Buffer | BufferRegion,
     out: Buffer | BufferRegion,
@@ -500,7 +502,8 @@ def reduce_abssum(
         True,
         parsed_real_shape,
     )
-    
+
+
 def reduce_absmax(
     buffer: Buffer | BufferRegion,
     out: Buffer | BufferRegion,
@@ -527,7 +530,8 @@ def reduce_absmax(
         parsed_clear,
         parsed_real_shape,
     )
-    
+
+
 def cumsum(
     src: Buffer | BufferRegion,
     dst: Buffer | BufferRegion | None = None,
