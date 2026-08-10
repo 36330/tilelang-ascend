@@ -518,7 +518,7 @@ def reduce_absmax(
     dim: int = -1,
     *args,
     clear=_REDUCE_KWARG_SENTINEL,
-    real_shape=_REDUCE_KWARG_SENTINEL
+    real_shape=_REDUCE_KWARG_SENTINEL,
 ):
     """Perform absolute-max reduction on the current Ascend fast-path."""
     parsed_clear, parsed_real_shape = _parse_reduce_optional_args(
