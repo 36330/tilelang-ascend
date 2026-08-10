@@ -58,11 +58,11 @@ from tilelang.utils.target import check_npu_availability, determine_platform  # 
 import tvm  # noqa: E402
 from tvm import tir  # noqa: E402
 
-
+ALL_TARGETS = ["ascendc", "pto"]
 REDUCE_OPS = {"reduce_abssum", "reduce_absmax"}
 CONTROL_REDUCE_OPS = {"reduce_sum", "reduce_max", "reduce_min"}
 ALL_OPS = ["reduce_sum", "reduce_max", "reduce_min", "reduce_abssum", "reduce_absmax", "cumsum"]
-ALL_TARGETS = ["ascendc", "pto"]
+
 
 RUNTIME_PASS_CONFIGS = {
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
