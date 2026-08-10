@@ -188,7 +188,9 @@ def _make_flat_kernel_half(M, D, CS_DIM, N, layout, dtype, block_M):
                     T.tile.add(y_second, y_second, tmp)
                     T.copy(y_first, K_OUT[row_start, 0])
                     T.copy(y_second, K_OUT[row_start, D_HALF])
+
     return main
+
 
 _flat_kernel_half_jit = tilelang.jit(out_idx=[4, 5], pass_configs=PASS_CONFIGS_FLAT)(_make_flat_kernel_half)
 
@@ -335,7 +337,9 @@ def _make_flat_kernel_interleaved(M, D, CS_DIM, N, layout, dtype, block_M):
                     T.tile.mul(x_rotate, x_rotate, sin_ub)
                     T.tile.add(out, out, x_rotate)
                     T.copy(out, K_OUT[row_start, 0])
+
     return main
+
 
 _flat_kernel_interleaved_jit = tilelang.jit(out_idx=[4, 5], pass_configs=PASS_CONFIGS_FLAT)(_make_flat_kernel_interleaved)
 
@@ -513,7 +517,9 @@ def _make_tile_kernel(B, S, N, D, layout, mode, dtype, Block_M, S_TILE, D_TILE, 
 
                         T.wait_flag("mte3", "mte2", 0)
                         T.wait_flag("mte3", "mte2", 1)
+
     return kernel
+
 
 _tile_kernel_jit = tilelang.jit(pass_configs=PASS_CONFIGS_TILE)(_make_tile_kernel)
 
@@ -607,7 +613,17 @@ def apply_rotary_pos_emb_tl(query, key, cos, sin, layout=0, rotaryMode="half"):
     tile_cache_key = (B, S, N, D, layout, rotaryMode, dtype_str, Block_M, S_TILE, D_TILE, num_stages)
     if tile_cache_key not in _tile_kernel_cache:
         _tile_kernel_cache[tile_cache_key] = _tile_kernel_jit(
-            B, S, N, D, layout, rotaryMode, dtype_str, Block_M, S_TILE, D_TILE, num_stages,
+            B,
+            S,
+            N,
+            D,
+            layout,
+            rotaryMode,
+            dtype_str,
+            Block_M,
+            S_TILE,
+            D_TILE,
+            num_stages,
         )
     kernel = _tile_kernel_cache[tile_cache_key]
 
@@ -618,6 +634,32 @@ def apply_rotary_pos_emb_tl(query, key, cos, sin, layout=0, rotaryMode="half"):
 
 
 def apply_rotary_pos_emb(query, key, cos, sin, layout=0, rotaryMode="half"):
+    if layout not in (0, 1):
+        raise ValueError("layout must be 0 ([B,S,N,D]) or 1 ([B,N,S,D])")
+    if rotaryMode not in ("half", "interleaved"):
+        raise ValueError("rotaryMode must be 'half' or 'interleaved'")
+    if query.dtype not in DTYPE_STR:
+        raise ValueError(f"unsupported dtype: {query.dtype}")
+    if key.dtype != query.dtype or cos.dtype != query.dtype or sin.dtype != query.dtype:
+        raise ValueError("query, key, cos and sin must have the same dtype")
+    if query.shape != key.shape:
+        raise ValueError("query and key must have the same shape")
+    if query.dim() != 4:
+        raise ValueError("query and key must be 4D tensors")
+    if query.shape[-1] % 2 != 0:
+        raise ValueError("head_dim must be even")
+    if cos.shape != sin.shape:
+        raise ValueError("cos and sin must have the same shape")
+    S = query.shape[1] if layout == 0 else query.shape[2]
+    D = query.shape[-1]
+    if cos.dim() == 2:
+        if cos.shape != (S, D // 2):
+            raise ValueError("2D cos/sin shape must be (seq_len, head_dim / 2)")
+    elif cos.dim() == 3:
+        if cos.shape != (query.shape[0], S, D // 2):
+            raise ValueError("3D cos/sin shape must be (batch_size, seq_len, head_dim / 2)")
+    else:
+        raise ValueError("cos and sin must be 2D or 3D tensors")
     return apply_rotary_pos_emb_tl(query, key, cos, sin, layout, rotaryMode)
 
 
