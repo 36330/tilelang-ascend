@@ -12,7 +12,7 @@
 #     python testing/python/language/test_tilelang_ascend_language_reduce_abssum_absmax_cumsum_issue.py --runtime cumsum ascendc
 
 
-# # What it prints: 
+# # What it prints:
 
 # # * which Python function T.reduce_sum/reduce_abssum/reduce_absmax/cumsum binds to
 # # * the PrimFunc produced by @T.prim_func
