@@ -22,9 +22,9 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import sys
+import inspect
 import traceback
 from pathlib import Path
 from typing import Callable
