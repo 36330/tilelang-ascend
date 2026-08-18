@@ -3605,26 +3605,6 @@ std::string CodeGenTileLangAscendPto::ResolveColReduceTmpName(
   return temp_name;
 }
 
-std::string CodeGenTileLangAscendPto::ResolveColReduceTmpName(
-    const ShapeInfo &dst, const ShapeInfo &src, const ShapeInfo &tmp) {
-  // TCOLSUM requires src, dst and tmp to expose the same element type. The
-  // injected scratch buffer is commonly byte-typed, so bind an aligned typed
-  // view over the same storage when needed.
-  ICHECK_EQ(dst.type, src.type)
-      << "Reduce_sum input dtype must be consistent with the output dtype.";
-  if (dst.type == tmp.type)
-    return tmp.ub_name;
-
-  std::string temp_name = GetTempVarName(tmp.ub_name);
-  int tmp_col = tmp.row * tmp.col * GetTypeLen(tmp.type) / GetTypeLen(dst.type);
-  tmp_col = GetValidShape(tmp_col, dst.type);
-  ShapeInfo tmp_cast = ShapeInfo{
-      1,          tmp_col,        1,          tmp_col,  1,           tmp_col,
-      tmp.extent, tmp.first_addr, tmp.offset, dst.type, tmp.ub_name, false};
-  CreateUbVariableND(temp_name, tmp_cast);
-  return temp_name;
-}
-
 void CodeGenTileLangAscendPto::ReduceOpCodegen(const CallNode *op) {
   std::string op_name_str = Downcast<StringImm>(op->args[0])->value;
 

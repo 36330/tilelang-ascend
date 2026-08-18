@@ -8,6 +8,7 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
+#include <tvm/arith/analyzer.h>
 
 #include <algorithm>
 #include <string>
@@ -329,6 +330,38 @@ int64_t EstimateAscendCBroadcastWorkspaceBytes(const CallNode *call) {
   return inner_workspace_elements(dtype_bytes) * dtype_bytes;
 }
 
+//////
+int64_t EstimateAscendCErfWorkspaceBytes(const CallNode *call) {
+  const DataType dtype = GetAccessPtrDtype(call->args[1]);
+  const int64_t src_bytes = GetAccessPtrBytes(call->args[1]);
+
+  const bool is_half = dtype.is_float() && dtype.bits() == 16;
+  const bool is_float = dtype.is_float() && dtype.bits() == 32;
+
+  ICHECK(is_half || is_float)
+      << "AscendC Erf only supports float16/bfloat16/float32, got " << dtype;
+
+  const int64_t factor = is_float ? 3 : 8;
+  return factor * std::max<int64_t>(src_bytes, 256);
+}
+
+int64_t EstimateAscendCTanhWorkspaceBytes(const CallNode *call) {
+  const DataType dtype = GetAccessPtrDtype(call->args[1]);
+  const int64_t src_bytes = GetAccessPtrBytes(call->args[1]);
+
+  const bool is_half = dtype.is_float() && dtype.bits() == 16;
+  const bool is_float = dtype.is_float() && dtype.bits() == 32;
+
+  ICHECK(is_half || is_float)
+      << "AscendC Tanh only supports float16/bfloat16/float32, got " << dtype;
+
+  const int64_t factor = is_float ? 1 : 4;
+  return factor * std::max<int64_t>(src_bytes, 256);
+}
+
+
+//////
+
 int64_t AlignReduceOutputCols(int64_t valid_col, int64_t dtype_bytes) {
   const int64_t aligned_bytes = ((valid_col * dtype_bytes + 31) / 32) * 32;
   return aligned_bytes / dtype_bytes;
@@ -433,18 +466,25 @@ int64_t EstimateReduceOutputWorkspaceBytes(const CallNode *call,
   const BufferNode *dst_buffer = FindBufferByDataVar(alloc_buffers, dst_var);
   ICHECK(dst_buffer) << "Buffer not found for " << dst_var->name_hint;
 
+  auto safe_int = [](const PrimExpr &e) -> int64_t {
+    if (e.as<IntImmNode>()) return Downcast<IntImm>(e)->value;
+    auto simplified = tvm::arith::Analyzer().Simplify(e);
+    if (simplified.as<IntImmNode>()) return Downcast<IntImm>(simplified)->value;
+    return 1;
+  };
+
   int64_t col = 1;
   if (dst_buffer->shape.size() == 1) {
-    col = Downcast<IntImm>(dst_buffer->shape[0])->value;
+    col = safe_int(dst_buffer->shape[0]);
   } else if (dst_buffer->shape.size() == 2 &&
-             Downcast<IntImm>(dst_buffer->shape[0])->value == 0) {
-    col = Downcast<IntImm>(dst_buffer->shape[1])->value;
+             safe_int(dst_buffer->shape[0]) == 0) {
+    col = safe_int(dst_buffer->shape[1]);
   } else if (dst_buffer->shape.size() == 2 &&
-             Downcast<IntImm>(dst_buffer->shape[1])->value == 0) {
-    col = Downcast<IntImm>(dst_buffer->shape[0])->value;
+             safe_int(dst_buffer->shape[1]) == 0) {
+    col = safe_int(dst_buffer->shape[0]);
   } else {
     ICHECK_GE(dst_buffer->shape.size(), 2U);
-    col = Downcast<IntImm>(dst_buffer->shape[1])->value;
+    col = safe_int(dst_buffer->shape[1]);
   }
 
   const int64_t extent = GetAccessPtrExtent(call->args[1]);
@@ -619,6 +659,14 @@ WorkspaceSpec GetAscendCWorkspaceSpec(const CallNode *call,
     const int64_t minimum = is_half ? 1152 : 768;
     return RequireWorkspace(byte_dtype, std::max(2 * src_bytes, minimum));
   }
+  //////
+  if (call->op.same_as(tl::ascend_erf())) {
+    return RequireWorkspace(byte_dtype, EstimateAscendCErfWorkspaceBytes(call));
+  }
+  if (call->op.same_as(tl::ascend_tanh())) {
+    return RequireWorkspace(byte_dtype, EstimateAscendCTanhWorkspaceBytes(call));
+  }
+  //////
   if (call->op.same_as(tl::ascend_bitwise_xor())) {
     return RequireWorkspace(
         byte_dtype, std::max<int64_t>(GetAccessPtrBytes(call->args[1]), 64));
@@ -1085,13 +1133,6 @@ private:
       if (tmp_buf_.defined()) {
         new_alloc_buffers.push_back(tmp_buf_);
       }
-      //////
-      cumsum_last_row_buf_ = createCumSumLastRowBuffer_(op->alloc_buffers);
-      if (cumsum_last_row_buf_.defined()) {
-        new_alloc_buffers.push_back(cumsum_last_row_buf_);
-      }
-      //////
-
       if ("pto" == target_) {
         reduce_out_tmp_buf_ = createPTOClearReduceOutputTmpBuffer_(
             op->alloc_buffers, name_supply);

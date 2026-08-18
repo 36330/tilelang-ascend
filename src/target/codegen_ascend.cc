@@ -734,6 +734,11 @@ void CodeGenTileLangAscend::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::ascend_cumsum())) {
     CumSumOpCodegen(op);
   }
+  else if (op->op.same_as(tl::ascend_erf())) {
+    ErfOpCodegen(op);
+  } else if (op->op.same_as(tl::ascend_tanh())) {
+    TanhOpCodegen(op);
+  }
   //////
   else {
     // tvm::Dump(op);
@@ -1582,6 +1587,91 @@ void CodeGenTileLangAscend::TrigOpCodegen(const CallNode *op,
   PrintOpCall(op, op_name, {0, len - 1}, {len - 1, len});
 }
 
+//////
+void CodeGenTileLangAscend::ErfOpCodegen(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 5U)
+      << "tl.ascend_erf expects dst, src, tmp, algo, count";
+
+  const DataType dtype = GetAccessPtrDtype(op->args[1].as<CallNode>());
+  const std::string type = getType(dtype);
+  const std::string dst = PrintBufferOffset(op->args[0].as<CallNode>());
+  const std::string src = PrintBufferOffset(op->args[1].as<CallNode>());
+  const std::string tmp = PrintBufferOffset(op->args[2].as<CallNode>());
+  const std::string algo = Downcast<StringImm>(op->args[3])->value;
+  const std::string count = PrintExpr(op->args[4]);
+
+  if (algo == "pade") {
+    this->PrintIndent();
+    this->stream << "AscendC::Erf(" << dst << ", " << src << ", " << tmp
+                 << ", " << count << ");\n";
+    return;
+  }
+
+  ICHECK_EQ(algo, "subsection_polynomial")
+      << "Unsupported T.tile.erf algo: " << algo;
+
+  this->PrintIndent();
+  this->stream << "{\n";
+  {
+    int scope = this->BeginScope();
+    this->PrintIndent();
+    this->stream
+        << "static constexpr AscendC::ErfAlgo erf_algo = "
+        << "AscendC::ErfAlgo::SUBSECTION_POLYNOMIAL_APPROXIMATION;\n";
+    this->PrintIndent();
+    this->stream
+        << "static constexpr AscendC::ErfConfig erf_config = {erf_algo};\n";
+    this->PrintIndent();
+    this->stream << "AscendC::Erf<" << type << ", false, erf_config>(" << dst
+                 << ", " << src << ", " << tmp << ", " << count << ");\n";
+    this->EndScope(scope);
+  }
+  this->PrintIndent();
+  this->stream << "}\n";
+}
+
+void CodeGenTileLangAscend::TanhOpCodegen(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 5U)
+      << "tl.ascend_tanh expects dst, src, tmp, algo, count";
+
+  const DataType dtype = GetAccessPtrDtype(op->args[1].as<CallNode>());
+  const std::string type = getType(dtype);
+  const std::string dst = PrintBufferOffset(op->args[0].as<CallNode>());
+  const std::string src = PrintBufferOffset(op->args[1].as<CallNode>());
+  const std::string tmp = PrintBufferOffset(op->args[2].as<CallNode>());
+  const std::string algo = Downcast<StringImm>(op->args[3])->value;
+  const std::string count = PrintExpr(op->args[4]);
+
+  if (algo == "intrinsic") {
+    this->PrintIndent();
+    this->stream << "AscendC::Tanh(" << dst << ", " << src << ", " << tmp
+                 << ", " << count << ");\n";
+    return;
+  }
+
+  ICHECK_EQ(algo, "subsection_compensation")
+      << "Unsupported T.tile.tanh algo: " << algo;
+
+  this->PrintIndent();
+  this->stream << "{\n";
+  {
+    int scope = this->BeginScope();
+    this->PrintIndent();
+    this->stream
+        << "static constexpr AscendC::TanhAlgo tanh_algo = "
+        << "AscendC::TanhAlgo::SUBSECTION_COMPENSATION;\n";
+    this->PrintIndent();
+    this->stream
+        << "static constexpr AscendC::TanhConfig tanh_config = {tanh_algo};\n";
+    this->PrintIndent();
+    this->stream << "AscendC::Tanh<" << type << ", false, tanh_config>(" << dst
+                 << ", " << src << ", " << tmp << ", " << count << ");\n";
+    this->EndScope(scope);
+  }
+  this->PrintIndent();
+  this->stream << "}\n";
+}
+//////
 void CodeGenTileLangAscend::TransposeCodegen(const CallNode *op,
                                              const std::string &op_name) {
   DataType dtype = GetAccessPtrDtype(op->args[1].as<CallNode>());

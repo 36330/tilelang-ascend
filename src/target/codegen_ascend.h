@@ -230,6 +230,8 @@ private:
   //////
   void SquareCodegen(const CallNode *op);
   void CumSumOpCodegen(const CallNode *op);
+  void ErfOpCodegen(const CallNode *op);
+  void TanhOpCodegen(const CallNode *op);
   //////
 
 private:

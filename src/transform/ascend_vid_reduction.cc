@@ -503,6 +503,9 @@ private:
         "tl.ascend_bitwise_and", "tl.ascend_bitwise_or",
         // unary_op: size = math.prod(dst_extent), assert size_0 == size_1
         "tl.ascend_exp", "tl.ascend_ln", "tl.ascend_abs",
+        //////
+        "tl.ascend_erf", "tl.ascend_tanh",
+        //////
         "tl.ascend_reciprocal", "tl.ascend_sqrt", "tl.ascend_rsqrt",
         "tl.ascend_relu", "tl.ascend_bitwise_not",
         // scalar_op: size = math.prod(src0_extent), assert size_0 == size_2

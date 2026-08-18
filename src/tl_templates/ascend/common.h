@@ -1056,58 +1056,41 @@ CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
   AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
   for (uint32_t r = 1; r < validRow; ++r) {
     AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    // Multiplication by one preserves signed zero while initializing the first
-    // row; Adds(..., 0) may canonicalize -0.0 on device.
-    AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-    for (uint32_t r = 1; r < validRow; ++r) {
-      AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
   }
+}
 
-  template <typename T>
-  CATLASS_DEVICE void tail_reduce_max(
-      LocalTensor<T> out, LocalTensor<T> src, LocalTensor<uint8_t> tmp, int dim,
-      uint32_t validRow, uint32_t validCol, uint32_t physCol, bool clear) {
-    (void)tmp;
-    (void)dim;
-    (void)clear;
-    if (validRow == 0 || validCol == 0)
-      return;
-    AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
-    for (uint32_t r = 1; r < validRow; ++r) {
-      AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-      AscendC::Muls(out, src, static_cast<T>(1),
-                    static_cast<int32_t>(validCol));
-      for (uint32_t r = 1; r < validRow; ++r) {
-        AscendC::Max(out, out, src[r * physCol],
-                     static_cast<int32_t>(validCol));
-      }
-    }
+template <typename T>
+CATLASS_DEVICE void tail_reduce_max(
+    LocalTensor<T> out, LocalTensor<T> src, LocalTensor<uint8_t> tmp, int dim,
+    uint32_t validRow, uint32_t validCol, uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
+  if (validRow == 0 || validCol == 0)
+    return;
+  AscendC::Max(out, src, src, static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
+  }
+}
 
-    template <typename T>
-    CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
-                                        LocalTensor<uint8_t> tmp, int dim,
-                                        uint32_t validRow, uint32_t validCol,
-                                        uint32_t physCol, bool clear) {
-      (void)tmp;
-      (void)dim;
-      (void)clear;
-      if (validRow == 0 || validCol == 0)
-        return;
-      AscendC::Muls(out, src, static_cast<T>(1),
-                    static_cast<int32_t>(validCol));
-      for (uint32_t r = 1; r < validRow; ++r) {
-        AscendC::Min(out, out, src[r * physCol],
-                     static_cast<int32_t>(validCol));
-        AscendC::Muls(out, src, static_cast<T>(1),
-                      static_cast<int32_t>(validCol));
-        for (uint32_t r = 1; r < validRow; ++r) {
-          AscendC::Min(out, out, src[r * physCol],
-                       static_cast<int32_t>(validCol));
-        }
-      }
+template <typename T>
+CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
+                                    LocalTensor<uint8_t> tmp, int dim,
+                                    uint32_t validRow, uint32_t validCol,
+                                    uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
+  if (validRow == 0 || validCol == 0)
+    return;
+  AscendC::Min(out, src, src, static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
+  }
+}
 
-      static constexpr uint32_t L0AB_EVENT = 0;
+static constexpr uint32_t L0AB_EVENT = 0;
 
       template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
                 bool transpose_A = false, bool transpose_B = false,

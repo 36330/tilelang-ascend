@@ -1,0 +1,2 @@
+/mnt/workspace/gitCode/cann/tail-kernel/tilelang-ascend/examples/flash_attention/opprof_sim_timeline/OPPROF_20260708115711_ZYTOVKMNLJAHFZSM/device0/main_kernel/0/dump
+main_kernel

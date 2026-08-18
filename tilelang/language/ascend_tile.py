@@ -3112,3 +3112,88 @@ def datacachecleanandinvalid_experiment(dst: Buffer, CacheLine: str, DcciDst: st
         f"AscendC::DataCacheCleanAndInvalid<{_dtype(dst)}, AscendC::CacheLine::{CacheLine}, AscendC::DcciDst::{DcciDst}>",
         dst.access_ptr("w"),
     )
+
+######
+
+def advanced_unary_op(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    op: str,
+    *,
+    tmp: Buffer | BufferRegion | None = None,
+    algo: str | None = None,
+):
+    if isinstance(dst, BufferRegion):
+        dst_ptr, dst_extent = _handle_buffer_region(dst, "w")
+    else:
+        dst_ptr = dst.access_ptr("w")
+        dst_extent = dst.shape
+
+    if isinstance(src0, BufferRegion):
+        src0_ptr, src0_extent = _handle_buffer_region(src0, "r")
+    else:
+        src0_ptr = src0.access_ptr("r")
+        src0_extent = src0.shape
+
+    size_0 = math.prod(dst_extent)
+    size_1 = math.prod(src0_extent)
+    assert size_0 == size_1, "size must be same"
+
+    if op == "erf":
+        algo = "pade" if algo is None else algo
+        allowed = {"pade", "subsection_polynomial"}
+    elif op == "tanh":
+        algo = "intrinsic" if algo is None else algo
+        allowed = {"intrinsic", "subsection_compensation"}
+    else:
+        raise ValueError(f"unsupported advanced unary op: {op}")
+
+    if algo not in allowed:
+        raise ValueError(f"T.tile.{op} algo must be one of {sorted(allowed)}, got {algo}")
+
+    return _call_intrin_with_optional_tmp(
+        op,
+        [dst_ptr, src0_ptr, algo, size_0],
+        2,
+        tmp,
+    )
+
+def erf(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    *,
+    tmp: Buffer | BufferRegion | None = None,
+    algo: str = "pade",
+):
+    """Performs element-wise error function: dst = erf(src0).
+
+    Args:
+        dst: The destination buffer.
+        src0: The source buffer.
+        tmp: Optional complete UB scratch storage.
+        algo: "pade" for AscendC default high-performance PADE approximation,
+            or "subsection_polynomial" for higher precision.
+    """
+    return advanced_unary_op(dst, src0, "erf", tmp=tmp, algo=algo)
+
+
+def tanh(
+    dst: Buffer | BufferRegion,
+    src0: Buffer | BufferRegion,
+    *,
+    tmp: Buffer | BufferRegion | None = None,
+    algo: str = "intrinsic",
+):
+    """Performs element-wise hyperbolic tangent: dst = tanh(src0).
+
+    Args:
+        dst: The destination buffer.
+        src0: The source buffer.
+        tmp: Optional complete UB scratch storage.
+        algo: "intrinsic" for AscendC default high-performance implementation,
+            or "subsection_compensation" for higher precision.
+    """
+    return advanced_unary_op(dst, src0, "tanh", tmp=tmp, algo=algo)
+
+
+######

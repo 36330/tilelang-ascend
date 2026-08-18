@@ -306,6 +306,19 @@ private:
     // Reduce: name(0) out(1) src(2) tmp(3) clear(4)
     if (call->op.same_as(ascend_reduce()))
       return RewriteReduce(call);
+    //////
+    // Erf/Tanh use the advanced math API with explicit tmp:
+    //   dst(0), src(1), tmp(2), count(3)
+    // They do not expose the same mask/repeat overload as basic unary ops in the
+    // current integration, so keep the full-tile call but propagate the valid
+    // rectangle for downstream ops such as reduce.
+    if (call->op.same_as(ascend_erf()) || call->op.same_as(ascend_tanh())) {
+      if (call->args.size() >= 2) {
+        PropagateUnaryShape(call->args[0], call->args[1]);
+      }
+      return Stmt();
+    }
+    //////
     // Cast: dst(0) src(1) roundmode(2) count(3) -- propagate only.
     if (call->op.same_as(ascend_cast())) {
       PropagateUnaryShape(call->args[0], call->args[1]);
