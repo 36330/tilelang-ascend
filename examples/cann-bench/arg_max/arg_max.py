@@ -74,6 +74,7 @@ def _argmax_wholereduce_kernel(M, N, block_N, in_dtype="float16"):
                     T.reduce_min(sel, min_idx, dim=-1, clear=True)
                     T.tile.cast(idx_out_i64, min_idx, "CAST_RINT", 8)
                     T.copy(idx_out_i64, Out[row, 0:8])
+
     return main
 
 
@@ -112,8 +113,7 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
 
                     for bn in T.serial(n_num):
                         col_start = bn * block_N
-                        T.copy(A[row, col_start : col_start + block_N], a_tile,
-                               pad_value=pad_val)
+                        T.copy(A[row, col_start : col_start + block_N], a_tile, pad_value=pad_val)
                         if use_fp32_compute:
                             T.tile.cast(a_cal, a_tile, CAST_MODE_LOW2HIGH, block_N)
                         else:
@@ -124,8 +124,7 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
                             best_tile[0] = bn
 
                     col_start = best_tile[0] * block_N
-                    T.copy(A[row, col_start : col_start + block_N], a_tile,
-                           pad_value=pad_val)
+                    T.copy(A[row, col_start : col_start + block_N], a_tile, pad_value=pad_val)
                     if use_fp32_compute:
                         T.tile.cast(a_cal, a_tile, CAST_MODE_LOW2HIGH, block_N)
                     else:
@@ -136,6 +135,7 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
                     running_idx_i32[0] = col_start + T.cast(tile_idx_f[0], "int32")
                     T.tile.cast(running_idx_i64, running_idx_i32, "CAST_NONE", 8)
                     T.copy(running_idx_i64, Out[row, 0:8])
+
     return main
 
 
@@ -248,10 +248,7 @@ def run_arg_max(case_id, shape, dtype_str, dim, keepdim, value_range):
         max_diff = (y.cpu() != ref.cpu()).sum().item()
         raise AssertionError(f"argmax mismatch: {max_diff} elements differ")
 
-    print(
-        f"Case {case_id}: PASSED  "
-        f"(shape={shape}, dtype={dtype_str}, dim={dim}, keepdim={keepdim})"
-    )
+    print(f"Case {case_id}: PASSED  (shape={shape}, dtype={dtype_str}, dim={dim}, keepdim={keepdim})")
 
 
 if __name__ == "__main__":
