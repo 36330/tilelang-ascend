@@ -1,4 +1,3 @@
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -107,6 +106,7 @@ def _gelu_tanh_kernel(N, block_N, dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
+
     return main
 
 
@@ -178,6 +178,7 @@ def _gelu_tanh_cast_kernel(N, block_N, in_dtype="float16", cal_dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
+
     return main
 
 
@@ -248,6 +249,7 @@ def _gelu_exact_hw_kernel(N, block_N, in_dtype="float16", cal_dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
+
     return main
 
 
@@ -361,6 +363,7 @@ def _gelu_exact_as_kernel(N, block_N, dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
+
     return main
 
 
@@ -480,6 +483,7 @@ def _gelu_exact_as_cast_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
+
     return main
 
 
@@ -493,10 +497,12 @@ def compute_mere_mare(actual, golden):
     mare = relative_err.max().item()
     return mere, mare
 
+
 def check_precision(actual, golden, threshold):
     mere, mare = compute_mere_mare(actual, golden)
     passed = (mere < threshold) and (mare < 10 * threshold)
     return passed, mere, mare
+
 
 def gen_input(shape, dtype_str, value_range):
     torch_dtype = TORCH_DTYPE_MAP[dtype_str]
@@ -574,10 +580,7 @@ def run_gelu(case_id, shape, dtype_str, approximate, value_range):
     ref_c = ref.cpu().float()
     torch.testing.assert_close(y_c, ref_c, rtol=rtol, atol=atol)
 
-    print(
-        f"Case {case_id}: PASSED  "
-        f"(shape={shape}, dtype={dtype_str}, approximate={approximate})"
-    )
+    print(f"Case {case_id}: PASSED  (shape={shape}, dtype={dtype_str}, approximate={approximate})")
 
 
 if __name__ == "__main__":
