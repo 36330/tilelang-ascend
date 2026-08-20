@@ -524,18 +524,18 @@ def run_gelu_kernel(x, approximate="none", block_N=BLOCK_N):
             if cache_key not in _KERNEL_CACHE:
                 _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="float16", cal_dtype="float32")
         else:
-            cache_key = (N, block_N, "fp16_exact_as_cast")
+            cache_key = (N, block_N, "fp16_exact_hw_cast")
             if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_exact_as_cast_kernel(N, 4096, in_dtype="float16", cal_dtype="float32")
+                _KERNEL_CACHE[cache_key] = _gelu_exact_hw_kernel(N, block_N, in_dtype="float16", cal_dtype="float32")
     elif orig_dtype == torch.bfloat16:
         if approximate == "tanh":
             cache_key = (N, block_N, "bf16_cast_tanh")
             if cache_key not in _KERNEL_CACHE:
                 _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float32")
         else:
-            cache_key = (N, block_N, "bf16_exact_as_cast")
+            cache_key = (N, block_N, "bf16_exact_hw_cast")
             if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_exact_as_cast_kernel(N, 4096, in_dtype="bfloat16", cal_dtype="float32")
+                _KERNEL_CACHE[cache_key] = _gelu_exact_hw_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float32")
     else:
         if approximate == "tanh":
             cache_key = (N, block_N, "fp32_tanh")
