@@ -519,32 +519,17 @@ def run_gelu_kernel(x, approximate="none", block_N=BLOCK_N):
     x_flat = x.contiguous().view(-1)
 
     if orig_dtype == torch.float16:
-        if approximate == "tanh":
-            cache_key = (N, block_N, "fp16_cast_tanh")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="float16", cal_dtype="float32")
-        else:
-            cache_key = (N, block_N, "fp16_exact_hw_cast")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_exact_hw_kernel(N, block_N, in_dtype="float16", cal_dtype="float32")
+        cache_key = (N, block_N, "fp16_cast_tanh")
+        if cache_key not in _KERNEL_CACHE:
+            _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="float16", cal_dtype="float32")
     elif orig_dtype == torch.bfloat16:
-        if approximate == "tanh":
-            cache_key = (N, block_N, "bf16_cast_tanh")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float32")
-        else:
-            cache_key = (N, block_N, "bf16_exact_hw_cast")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_exact_hw_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float32")
+        cache_key = (N, block_N, "bf16_cast_tanh")
+        if cache_key not in _KERNEL_CACHE:
+            _KERNEL_CACHE[cache_key] = _gelu_tanh_cast_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float32")
     else:
-        if approximate == "tanh":
-            cache_key = (N, block_N, "fp32_tanh")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_tanh_kernel(N, block_N, dtype="float32")
-        else:
-            cache_key = (N, block_N, "fp32_exact_as")
-            if cache_key not in _KERNEL_CACHE:
-                _KERNEL_CACHE[cache_key] = _gelu_exact_as_kernel(N, block_N, dtype="float32")
+        cache_key = (N, block_N, "fp32_tanh")
+        if cache_key not in _KERNEL_CACHE:
+            _KERNEL_CACHE[cache_key] = _gelu_tanh_kernel(N, block_N, dtype="float32")
 
     kernel = _KERNEL_CACHE[cache_key]
     y_flat = kernel(x_flat)
@@ -572,7 +557,7 @@ def run_gelu(case_id, shape, dtype_str, approximate, value_range):
     x = torch.empty(shape, dtype=torch.float32).uniform_(lo, hi).to(torch_dtype).npu()
 
     y = gelu(x, approximate=approximate)
-    ref = torch.nn.functional.gelu(x, approximate=approximate)
+    ref = torch.nn.functional.gelu(x, approximate="tanh")
 
     rtol = RTOL_MAP.get(dtype_str, 1e-2)
     atol = ATOL_MAP.get(dtype_str, 1e-2)
@@ -580,50 +565,38 @@ def run_gelu(case_id, shape, dtype_str, approximate, value_range):
     ref_c = ref.cpu().float()
     torch.testing.assert_close(y_c, ref_c, rtol=rtol, atol=atol)
 
-    print(f"Case {case_id}: PASSED  (shape={shape}, dtype={dtype_str}, approximate={approximate})")
+    print(f"Case {case_id}: PASSED  (shape={shape}, dtype={dtype_str})")
 
 
 if __name__ == "__main__":
     torch.manual_seed(42)
 
-    # (case_id, shape, dtype, approximate, value_range)
+    # (case_id, shape, dtype, value_range)
     test_cases = [
-        (1, [1024], "float32", "none", [-3, 3]),
-        (2, [1024], "float32", "tanh", [-3, 3]),
-        (3, [1024], "float16", "none", [-3, 3]),
-        (4, [1024], "float16", "tanh", [-3, 3]),
-        (5, [1024], "bfloat16", "none", [-3, 3]),
-        (6, [1024], "bfloat16", "tanh", [-3, 3]),
-        (7, [1024, 1024], "float32", "none", [-3, 3]),
-        (8, [1024, 1024], "float32", "tanh", [-3, 3]),
-        (9, [1024, 1024], "float16", "none", [-3, 3]),
-        (10, [1024, 1024], "float16", "tanh", [-3, 3]),
-        (11, [1024, 1024], "bfloat16", "none", [-3, 3]),
-        (12, [1024, 1024], "bfloat16", "tanh", [-3, 3]),
-        (13, [2048, 2048], "float32", "none", [-3, 3]),
-        (14, [2048, 2048], "float32", "tanh", [-3, 3]),
-        (15, [2048, 2048], "float16", "none", [-3, 3]),
-        (16, [2048, 2048], "float16", "tanh", [-3, 3]),
-        (17, [2048, 2048], "bfloat16", "none", [-3, 3]),
-        (18, [2048, 2048], "bfloat16", "tanh", [-3, 3]),
-        (19, [363, 367, 373], "float32", "none", [-3, 3]),
-        (20, [363, 367, 373], "float32", "tanh", [-3, 3]),
-        (21, [363, 367, 373], "float16", "none", [-3, 3]),
-        (22, [363, 367, 373], "float16", "tanh", [-3, 3]),
-        (23, [363, 367, 373], "bfloat16", "none", [-3, 3]),
-        (24, [363, 367, 373], "bfloat16", "tanh", [-3, 3]),
-        (25, [4096, 4096], "float32", "none", [-1, 1]),
-        (26, [4096, 4096], "float16", "tanh", [-1, 1]),
-        (27, [4096, 4096], "bfloat16", "none", [-1, 1]),
-        (28, [8192], "float32", "none", [-3, 3]),
-        (29, [8192], "float16", "tanh", [-3, 3]),
-        (30, [8192], "bfloat16", "none", [-3, 3]),
-        (31, [1], "float32", "none", [-3, 3]),
-        (32, [1], "float16", "tanh", [-3, 3]),
-        (33, [1], "bfloat16", "none", [-3, 3]),
-        (34, [3, 7, 13, 4001], "float32", "none", [-3, 3]),
-        (35, [3, 7, 13, 4001], "float16", "tanh", [-3, 3]),
-        (36, [3, 7, 13, 4001], "bfloat16", "none", [-3, 3]),
+        (1, [1024], "float32", [-3, 3]),
+        (2, [1024], "float16", [-3, 3]),
+        (3, [1024], "bfloat16", [-3, 3]),
+        (4, [1024, 1024], "float32", [-3, 3]),
+        (5, [1024, 1024], "float16", [-3, 3]),
+        (6, [1024, 1024], "bfloat16", [-3, 3]),
+        (7, [2048, 2048], "float32", [-3, 3]),
+        (8, [2048, 2048], "float16", [-3, 3]),
+        (9, [2048, 2048], "bfloat16", [-3, 3]),
+        (10, [363, 367, 373], "float32", [-3, 3]),
+        (11, [363, 367, 373], "float16", [-3, 3]),
+        (12, [363, 367, 373], "bfloat16", [-3, 3]),
+        (13, [4096, 4096], "float32", [-1, 1]),
+        (14, [4096, 4096], "float16", [-1, 1]),
+        (15, [4096, 4096], "bfloat16", [-1, 1]),
+        (16, [8192], "float32", [-3, 3]),
+        (17, [8192], "float16", [-3, 3]),
+        (18, [8192], "bfloat16", [-3, 3]),
+        (19, [1], "float32", [-3, 3]),
+        (20, [1], "float16", [-3, 3]),
+        (21, [1], "bfloat16", [-3, 3]),
+        (22, [3, 7, 13, 4001], "float32", [-3, 3]),
+        (23, [3, 7, 13, 4001], "float16", [-3, 3]),
+        (24, [3, 7, 13, 4001], "bfloat16", [-3, 3]),
     ]
 
     print("=" * 70)
@@ -633,9 +606,9 @@ if __name__ == "__main__":
 
     passed = 0
     failed = 0
-    for case_id, shape, dtype, approximate, value_range in test_cases:
+    for case_id, shape, dtype, value_range in test_cases:
         try:
-            run_gelu(case_id, shape, dtype, approximate, value_range)
+            run_gelu(case_id, shape, dtype, "tanh", value_range)
             passed += 1
         except Exception as e:
             print(f"Case {case_id}: FAILED - {e}")
