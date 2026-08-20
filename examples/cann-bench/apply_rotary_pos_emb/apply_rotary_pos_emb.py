@@ -664,3 +664,189 @@ def apply_rotary_pos_emb(query, key, cos, sin, layout=0, rotaryMode="half"):
 
 
 __all__ = ["apply_rotary_pos_emb"]
+
+
+# ---------------------------------------------------------------------------
+# Test harness
+# ---------------------------------------------------------------------------
+DTYPE_MAP = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
+RTOL_MAP = {"float16": 1e-2, "bfloat16": 1e-2, "float32": 5e-3}
+ATOL_MAP = {"float16": 1e-1, "bfloat16": 1e-1, "float32": 5e-2}
+
+
+def _make_input(shape, dtype_str, value_range, seed):
+    torch_dtype = DTYPE_MAP[dtype_str]
+    lo, hi = value_range
+    generator = torch.Generator().manual_seed(seed)
+    return (torch.rand(shape, dtype=torch.float32, generator=generator) * (hi - lo) + lo).to(torch_dtype).npu()
+
+
+def _rotate_half(x, mode):
+    if mode == "interleaved":
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+    half_dim = x.shape[-1] // 2
+    return torch.cat((-x[..., half_dim:], x[..., :half_dim]), dim=-1)
+
+
+def _golden(query, key, cos, sin, layout=0, rotary_mode="half"):
+    compute_dtype = torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    q = query.to(compute_dtype)
+    k = key.to(compute_dtype)
+    c = cos.to(compute_dtype)
+    s = sin.to(compute_dtype)
+
+    def apply_one(x):
+        cos_work = c
+        sin_work = s
+        if cos_work.dim() == 2:
+            cos_work = cos_work.unsqueeze(0).unsqueeze(2)
+            sin_work = sin_work.unsqueeze(0).unsqueeze(2)
+        elif cos_work.dim() == 3:
+            cos_work = cos_work.unsqueeze(2)
+            sin_work = sin_work.unsqueeze(2)
+        if layout == 1:
+            cos_work = cos_work.transpose(1, 2)
+            sin_work = sin_work.transpose(1, 2)
+        if rotary_mode == "interleaved":
+            cos_work = cos_work.unsqueeze(-1).expand(*cos_work.shape, 2).reshape(*cos_work.shape[:-1], -1)
+            sin_work = sin_work.unsqueeze(-1).expand(*sin_work.shape, 2).reshape(*sin_work.shape[:-1], -1)
+        else:
+            cos_work = cos_work.repeat(1, 1, 1, 2)
+            sin_work = sin_work.repeat(1, 1, 1, 2)
+        return x * cos_work + _rotate_half(x, rotary_mode) * sin_work
+
+    q_out = apply_one(q)
+    k_out = apply_one(k)
+    if query.dtype in (torch.float16, torch.bfloat16):
+        q_out = q_out.to(query.dtype)
+        k_out = k_out.to(key.dtype)
+    return q_out, k_out
+
+
+def run_apply_rotary_pos_emb(case_id, shapes, dtype_str, layout, rotary_mode, value_ranges):
+    q = _make_input(tuple(shapes[0]), dtype_str, value_ranges[0], 1000 + case_id * 4)
+    k = _make_input(tuple(shapes[1]), dtype_str, value_ranges[1], 1001 + case_id * 4)
+    c = _make_input(tuple(shapes[2]), dtype_str, value_ranges[2], 1002 + case_id * 4)
+    s = _make_input(tuple(shapes[3]), dtype_str, value_ranges[3], 1003 + case_id * 4)
+
+    q_out, k_out = apply_rotary_pos_emb(q, k, c, s, layout=layout, rotaryMode=rotary_mode)
+    q_ref, k_ref = _golden(q.cpu(), k.cpu(), c.cpu(), s.cpu(), layout, rotary_mode)
+
+    rtol = RTOL_MAP[dtype_str]
+    atol = ATOL_MAP[dtype_str]
+    torch.testing.assert_close(q_out.cpu().float(), q_ref.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(k_out.cpu().float(), k_ref.float(), rtol=rtol, atol=atol)
+
+    print(f"Case {case_id}: PASSED  (shapes={shapes}, dtype={dtype_str}, layout={layout}, mode={rotary_mode})")
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    tilelang.disable_cache()
+
+    # (case_id, shapes, dtype, layout, rotary_mode, value_ranges)
+    test_cases = [
+        (1, [[2, 8, 2, 64], [2, 8, 2, 64], [8, 32], [8, 32]], "float16", 0, "half", [[-1, 1]] * 4),
+        (2, [[2, 2, 8, 64], [2, 2, 8, 64], [8, 32], [8, 32]], "float32", 1, "interleaved", [[-1, 1]] * 4),
+        (3, [[1, 16, 1, 128], [1, 16, 1, 128], [16, 64], [16, 64]], "bfloat16", 0, "half", [[-1, 1]] * 4),
+        (4, [[16, 512, 16, 128], [16, 512, 16, 128], [512, 64], [512, 64]], "float16", 0, "half", [[-1, 1]] * 4),
+        (5, [[7, 1021, 31, 64], [7, 1021, 31, 64], [1021, 32], [1021, 32]], "float32", 0, "half", [[-2, 2], [-2, 2], [-1, 1], [-1, 1]]),
+        (6, [[31, 251, 7, 128], [31, 251, 7, 128], [251, 64], [251, 64]], "bfloat16", 0, "half", [[-3, 3], [-3, 3], [-1, 1], [-1, 1]]),
+        (7, [[15, 16, 511, 128], [15, 16, 511, 128], [511, 64], [511, 64]], "float16", 1, "half", [[-10, 10], [-10, 10], [-1, 1], [-1, 1]]),
+        (
+            8,
+            [[8, 2048, 16, 128], [8, 2048, 16, 128], [2048, 64], [2048, 64]],
+            "float32",
+            0,
+            "interleaved",
+            [[-100, 100], [-100, 100], [-1, 1], [-1, 1]],
+        ),
+        (
+            9,
+            [[17, 15, 1021, 64], [17, 15, 1021, 64], [1021, 32], [1021, 32]],
+            "bfloat16",
+            1,
+            "interleaved",
+            [[-1000, 1000], [-1000, 1000], [-1, 1], [-1, 1]],
+        ),
+        (
+            10,
+            [[13, 511, 13, 128], [13, 511, 13, 128], [511, 64], [511, 64]],
+            "float16",
+            0,
+            "half",
+            [[-0.1, 0.1], [-0.1, 0.1], [-1, 1], [-1, 1]],
+        ),
+        (11, [[7, 1009, 7, 128], [7, 1009, 7, 128], [1009, 64], [1009, 64]], "float32", 0, "half", [[-1, 2], [-1, 2], [-1, 1], [-1, 1]]),
+        (12, [[257, 17, 17, 128], [257, 17, 17, 128], [17, 64], [17, 64]], "bfloat16", 1, "half", [[-5, 10], [-5, 10], [-1, 1], [-1, 1]]),
+        (
+            13,
+            [[11, 503, 11, 128], [11, 503, 11, 128], [503, 64], [503, 64]],
+            "float16",
+            0,
+            "interleaved",
+            [[-50, 100], [-50, 100], [-1, 1], [-1, 1]],
+        ),
+        (
+            14,
+            [[19, 1023, 19, 64], [19, 1023, 19, 64], [1023, 32], [1023, 32]],
+            "float32",
+            0,
+            "half",
+            [[-65504, 65504], [-65504, 65504], [-1, 1], [-1, 1]],
+        ),
+        (
+            15,
+            [[4001, 3, 3, 64], [4001, 3, 3, 64], [3, 32], [3, 32]],
+            "bfloat16",
+            1,
+            "interleaved",
+            [[-88, 88], [-88, 88], [-1, 1], [-1, 1]],
+        ),
+        (16, [[3, 13, 17, 128], [3, 13, 17, 128], [13, 64], [13, 64]], "float32", 0, "half", [[-1, 1]] * 4),
+        (17, [[509, 4, 4, 128], [509, 4, 4, 128], [4, 64], [4, 64]], "bfloat16", 1, "half", [[0, 0]] * 4),
+        (
+            18,
+            [[16, 61, 16, 128], [16, 61, 16, 128], [61, 64], [61, 64]],
+            "float16",
+            0,
+            "half",
+            [[-0.5, 0.5], [-0.5, 0.5], [-1, 1], [-1, 1]],
+        ),
+        (19, [[8, 255, 8, 128], [8, 255, 8, 128], [255, 64], [255, 64]], "bfloat16", 0, "half", [[-1, 1]] * 4),
+        (
+            20,
+            [[7, 2047, 7, 128], [7, 2047, 7, 128], [2047, 64], [2047, 64]],
+            "float32",
+            0,
+            "interleaved",
+            [[-3, 6], [-3, 6], [-1, 1], [-1, 1]],
+        ),
+    ]
+
+    print("=" * 70)
+    print("ApplyRotaryPosEmb TileLang-Ascend 测试")
+    print(f"共 {len(test_cases)} 个测试用例")
+    print("=" * 70)
+
+    passed = 0
+    failed = 0
+    for case_id, shapes, dtype, layout, rotary_mode, value_ranges in test_cases:
+        try:
+            run_apply_rotary_pos_emb(case_id, shapes, dtype, layout, rotary_mode, value_ranges)
+            passed += 1
+        except Exception as e:
+            print(f"Case {case_id}: FAILED - {e}")
+            failed += 1
+
+    print("=" * 70)
+    print(f"测试完成: {passed} passed, {failed} failed")
+    if failed == 0:
+        print("Test Passed!")
