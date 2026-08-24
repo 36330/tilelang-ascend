@@ -112,7 +112,6 @@ def _gelu_tanh_kernel(N, block_N, dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
-                
     return main
 
 
@@ -183,7 +182,6 @@ def _gelu_tanh_cast_kernel(N, block_N, in_dtype="float16", cal_dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
-                
     return main
 
 
@@ -295,7 +293,6 @@ def _gelu_exact_as_kernel(N, block_N, dtype="float32"):
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
-                
     return main
 
 
@@ -417,7 +414,6 @@ def _gelu_exact_as_cast_kernel(N, block_N, in_dtype="bfloat16", cal_dtype="float
 
                 T.wait_flag("mte3", "mte2", 0)
                 T.wait_flag("mte3", "mte2", 1)
-                
     return main
 
 
@@ -462,7 +458,6 @@ def run_gelu_kernel(x, approximate="none", block_N=None):
     kernel = _KERNEL_CACHE[cache_key]
     y_flat = kernel(x_flat)
     y = y_flat.view(x.shape)
-    
     return y
 
 
