@@ -476,6 +476,7 @@ if __name__ == "__main__":
     import torch.nn.functional as F
 
     torch.manual_seed(0)
+    all_ok = True
 
     print("=== Exact mode (approximate='none') ===")
     for dt_name, dt in [("float16", torch.float16), ("float32", torch.float32), ("bfloat16", torch.bfloat16)]:
@@ -483,7 +484,9 @@ if __name__ == "__main__":
         y = gelu(x, approximate="none")
         ref = F.gelu(x.cpu(), approximate="none")
         err = (y.cpu().float() - ref.float()).abs() / (ref.float().abs() + 1e-7)
-        print(f"  {dt_name}: mere={err.mean():.2e} mare={err.max():.2e}")
+        ok = err.mean() < 1e-3 and err.max() < 1e-1
+        all_ok = all_ok and ok
+        print(f"  {dt_name}: mere={err.mean():.2e} mare={err.max():.2e} {'OK' if ok else 'FAIL'}")
 
     print("=== Tanh mode (approximate='tanh') ===")
     for dt_name, dt in [("float16", torch.float16), ("float32", torch.float32), ("bfloat16", torch.bfloat16)]:
@@ -491,7 +494,9 @@ if __name__ == "__main__":
         y = gelu(x, approximate="tanh")
         ref = F.gelu(x.cpu(), approximate="tanh")
         err = (y.cpu().float() - ref.float()).abs() / (ref.float().abs() + 1e-7)
-        print(f"  {dt_name}: mere={err.mean():.2e} mare={err.max():.2e}")
+        ok = err.mean() < 1e-3 and err.max() < 1e-1
+        all_ok = all_ok and ok
+        print(f"  {dt_name}: mere={err.mean():.2e} mare={err.max():.2e} {'OK' if ok else 'FAIL'}")
 
     print("=== Small tensor ===")
     for N in [100, 512, 1024]:
@@ -499,7 +504,12 @@ if __name__ == "__main__":
         y = gelu(x, approximate="none")
         ref = F.gelu(x.cpu(), approximate="none")
         err = (y.cpu() - ref).abs() / (ref.abs() + 1e-7)
-        print(f"  N={N}: mere={err.mean():.2e} mare={err.max():.2e}")
+        ok = err.mean() < 1e-3 and err.max() < 1e-1
+        all_ok = all_ok and ok
+        print(f"  N={N}: mere={err.mean():.2e} mare={err.max():.2e} {'OK' if ok else 'FAIL'}")
 
     torch.npu.synchronize()
-    print("Done")
+    if all_ok:
+        print("TEST PASSED!")
+    else:
+        print("TEST FAILED!")
