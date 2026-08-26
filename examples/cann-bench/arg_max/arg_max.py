@@ -53,11 +53,15 @@ def _cast_int64_to_float32_kernel(M, N, block_N):
                 if row < M:
                     for bn in T.serial(n_num):
                         col_start = bn * block_N
-                        T.copy(A[row, col_start : col_start + block_N], a_tile,
-                               pad_value=-2147483647)
+                        T.copy(
+                            A[row, col_start : col_start + block_N],
+                            a_tile,
+                            pad_value=-2147483647,
+                        )
                         T.tile.cast(a_tmp, a_tile, "CAST_NONE", block_N)
                         T.tile.cast(b_tile, a_tmp, "CAST_NONE", block_N)
                         T.copy(b_tile, B[row, col_start : col_start + block_N])
+
     return main
 
 
@@ -101,16 +105,35 @@ def _argmax_nonlast_kernel(batch, M, N, block_N, in_dtype):
 
                     if has_nan:
                         T.tile.compare(gt_mask, row_cal, row_cal, "EQ")
-                        T.tile.select(row_cal, gt_mask, row_cal, T.infinity(cal_dtype), "VSEL_TENSOR_SCALAR_MODE")
+                        T.tile.select(
+                            row_cal,
+                            gt_mask,
+                            row_cal,
+                            T.infinity(cal_dtype),
+                            "VSEL_TENSOR_SCALAR_MODE",
+                        )
 
                     T.tile.fill(idx_buf, T.cast(m, cal_dtype))
                     T.tile.compare(gt_mask, row_cal, running_max, "GT")
-                    T.tile.select(running_max, gt_mask, row_cal, running_max, "VSEL_TENSOR_TENSOR_MODE")
-                    T.tile.select(running_idx, gt_mask, idx_buf, running_idx, "VSEL_TENSOR_TENSOR_MODE")
+                    T.tile.select(
+                        running_max,
+                        gt_mask,
+                        row_cal,
+                        running_max,
+                        "VSEL_TENSOR_TENSOR_MODE",
+                    )
+                    T.tile.select(
+                        running_idx,
+                        gt_mask,
+                        idx_buf,
+                        running_idx,
+                        "VSEL_TENSOR_TENSOR_MODE",
+                    )
 
                 idx_out = T.alloc_ub([block_N], "int64")
                 T.tile.cast(idx_out, running_idx, "CAST_RINT", block_N)
                 T.copy(idx_out, Out[b, col_start])
+
     return main
 
 
@@ -151,14 +174,23 @@ def _argmax_wholereduce_kernel(M, N, block_N, in_dtype="float16"):
 
                     if has_nan:
                         T.tile.compare(mask, a_cal, a_cal, "EQ")
-                        T.tile.select(a_cal, mask, a_cal, T.infinity(cal_dtype), "VSEL_TENSOR_SCALAR_MODE")
+                        T.tile.select(
+                            a_cal,
+                            mask,
+                            a_cal,
+                            T.infinity(cal_dtype),
+                            "VSEL_TENSOR_SCALAR_MODE",
+                        )
 
                     T.reduce_max(a_cal, max_val, dim=-1, clear=True)
                     T.tile.compare(mask, a_cal, max_val[0], "EQ")
-                    T.tile.select(sel, mask, idx_buf, 999999.0, "VSEL_TENSOR_SCALAR_MODE")
+                    T.tile.select(
+                        sel, mask, idx_buf, 999999.0, "VSEL_TENSOR_SCALAR_MODE"
+                    )
                     T.reduce_min(sel, min_idx, dim=-1, clear=True)
                     T.tile.cast(idx_out_i64, min_idx, "CAST_RINT", 8)
-                    T.copy(idx_out_i64[0:1], Out[row:row+1])
+                    T.copy(idx_out_i64[0:1], Out[row : row + 1])
+
     return main
 
 
@@ -199,8 +231,11 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
 
                     for bn in T.serial(n_num):
                         col_start = bn * block_N
-                        T.copy(A[row, col_start : col_start + block_N], a_tile,
-                               pad_value=pad_val)
+                        T.copy(
+                            A[row, col_start : col_start + block_N],
+                            a_tile,
+                            pad_value=pad_val,
+                        )
                         if use_fp32_compute:
                             T.tile.cast(a_cal, a_tile, "CAST_NONE", block_N)
                         else:
@@ -208,7 +243,13 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
 
                         if has_nan:
                             T.tile.compare(mask, a_cal, a_cal, "EQ")
-                            T.tile.select(a_cal, mask, a_cal, T.infinity(cal_dtype), "VSEL_TENSOR_SCALAR_MODE")
+                            T.tile.select(
+                                a_cal,
+                                mask,
+                                a_cal,
+                                T.infinity(cal_dtype),
+                                "VSEL_TENSOR_SCALAR_MODE",
+                            )
 
                         T.reduce_max(a_cal, tile_max, dim=-1, clear=True)
                         if tile_max[0] > running_max[0]:
@@ -216,8 +257,11 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
                             best_tile[0] = bn
 
                     col_start = best_tile[0] * block_N
-                    T.copy(A[row, col_start : col_start + block_N], a_tile,
-                           pad_value=pad_val)
+                    T.copy(
+                        A[row, col_start : col_start + block_N],
+                        a_tile,
+                        pad_value=pad_val,
+                    )
                     if use_fp32_compute:
                         T.tile.cast(a_cal, a_tile, "CAST_NONE", block_N)
                     else:
@@ -225,14 +269,21 @@ def _argmax_sort_kernel(M, N, block_N, in_dtype="float16"):
 
                     if has_nan:
                         T.tile.compare(mask, a_cal, a_cal, "EQ")
-                        T.tile.select(a_cal, mask, a_cal, T.infinity(cal_dtype), "VSEL_TENSOR_SCALAR_MODE")
+                        T.tile.select(
+                            a_cal,
+                            mask,
+                            a_cal,
+                            T.infinity(cal_dtype),
+                            "VSEL_TENSOR_SCALAR_MODE",
+                        )
 
                     T.tile.sort(sort_dst, a_cal, block_N)
                     T.tile.gather_mask(tile_max_f, sort_dst, "P0101")
                     T.tile.gather_mask(tile_idx_f, sort_dst, "P1010")
                     running_idx_i32[0] = col_start + T.cast(tile_idx_f[0], "int32")
                     T.tile.cast(running_idx_i64, running_idx_i32, "CAST_NONE", 8)
-                    T.copy(running_idx_i64[0:1], Out[row:row+1])
+                    T.copy(running_idx_i64[0:1], Out[row : row + 1])
+
     return main
 
 
@@ -244,7 +295,9 @@ def _get_kernel(M, N, tl_dtype):
             block_N = 64
         n_num = (N + block_N - 1) // block_N
         if n_num <= 1:
-            _kernel_cache[key] = _argmax_wholereduce_kernel(M, N, block_N, in_dtype=tl_dtype)
+            _kernel_cache[key] = _argmax_wholereduce_kernel(
+                M, N, block_N, in_dtype=tl_dtype
+            )
         else:
             _kernel_cache[key] = _argmax_sort_kernel(M, N, block_N, in_dtype=tl_dtype)
     return _kernel_cache[key]
@@ -253,11 +306,15 @@ def _get_kernel(M, N, tl_dtype):
 def _get_nonlast_kernel(batch, M, N, tl_dtype):
     key = ("nonlast", batch, M, N, tl_dtype)
     if key not in _kernel_cache:
-        block_N = min(((N + _NONLAST_BLOCK_N - 1) // _NONLAST_BLOCK_N) * _NONLAST_BLOCK_N, _MAX_BLOCK_N)
+        block_N = min(
+            ((N + _NONLAST_BLOCK_N - 1) // _NONLAST_BLOCK_N) * _NONLAST_BLOCK_N,
+            _MAX_BLOCK_N,
+        )
         if block_N < _NONLAST_BLOCK_N:
             block_N = _NONLAST_BLOCK_N
         _kernel_cache[key] = _argmax_nonlast_kernel(
-            batch, M, N, block_N, in_dtype=tl_dtype)
+            batch, M, N, block_N, in_dtype=tl_dtype
+        )
     return _kernel_cache[key]
 
 
@@ -294,7 +351,9 @@ def arg_max(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tenso
 
         x_3d = input.reshape(batch, reduce_size, inner_size)
         if is_int64:
-            x_3d = _get_cast_int64_kernel(batch * reduce_size, inner_size)(x_3d.reshape(batch * reduce_size, inner_size)).reshape(batch, reduce_size, inner_size)
+            x_3d = _get_cast_int64_kernel(batch * reduce_size, inner_size)(
+                x_3d.reshape(batch * reduce_size, inner_size)
+            ).reshape(batch, reduce_size, inner_size)
             tl_dtype = "float"
         else:
             tl_dtype = torch_dtype_to_tl(input.dtype)
@@ -339,6 +398,7 @@ def arg_max(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tenso
 
 if __name__ == "__main__":
     import torch
+
     torch.manual_seed(0)
     x = torch.randn(1024, 1024, dtype=torch.float32).npu()
     y = arg_max(x, dim=-1)
