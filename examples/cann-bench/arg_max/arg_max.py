@@ -184,9 +184,7 @@ def _argmax_wholereduce_kernel(M, N, block_N, in_dtype="float16"):
 
                     T.reduce_max(a_cal, max_val, dim=-1, clear=True)
                     T.tile.compare(mask, a_cal, max_val[0], "EQ")
-                    T.tile.select(
-                        sel, mask, idx_buf, 999999.0, "VSEL_TENSOR_SCALAR_MODE"
-                    )
+                    T.tile.select(sel, mask, idx_buf, 999999.0, "VSEL_TENSOR_SCALAR_MODE")
                     T.reduce_min(sel, min_idx, dim=-1, clear=True)
                     T.tile.cast(idx_out_i64, min_idx, "CAST_RINT", 8)
                     T.copy(idx_out_i64[0:1], Out[row : row + 1])
@@ -295,9 +293,7 @@ def _get_kernel(M, N, tl_dtype):
             block_N = 64
         n_num = (N + block_N - 1) // block_N
         if n_num <= 1:
-            _kernel_cache[key] = _argmax_wholereduce_kernel(
-                M, N, block_N, in_dtype=tl_dtype
-            )
+            _kernel_cache[key] = _argmax_wholereduce_kernel(M, N, block_N, in_dtype=tl_dtype)
         else:
             _kernel_cache[key] = _argmax_sort_kernel(M, N, block_N, in_dtype=tl_dtype)
     return _kernel_cache[key]
@@ -312,9 +308,7 @@ def _get_nonlast_kernel(batch, M, N, tl_dtype):
         )
         if block_N < _NONLAST_BLOCK_N:
             block_N = _NONLAST_BLOCK_N
-        _kernel_cache[key] = _argmax_nonlast_kernel(
-            batch, M, N, block_N, in_dtype=tl_dtype
-        )
+        _kernel_cache[key] = _argmax_nonlast_kernel(batch, M, N, block_N, in_dtype=tl_dtype)
     return _kernel_cache[key]
 
 
@@ -351,9 +345,9 @@ def arg_max(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tenso
 
         x_3d = input.reshape(batch, reduce_size, inner_size)
         if is_int64:
-            x_3d = _get_cast_int64_kernel(batch * reduce_size, inner_size)(
-                x_3d.reshape(batch * reduce_size, inner_size)
-            ).reshape(batch, reduce_size, inner_size)
+            x_3d = _get_cast_int64_kernel(batch * reduce_size, inner_size)(x_3d.reshape(batch * reduce_size, inner_size)).reshape(
+                batch, reduce_size, inner_size
+            )
             tl_dtype = "float"
         else:
             tl_dtype = torch_dtype_to_tl(input.dtype)
