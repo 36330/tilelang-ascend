@@ -1,15 +1,19 @@
-import os
-import sys
 import torch
 import torch_npu  # noqa: F401
 import tilelang
 from tilelang import language as T
 
-try:
-    from ._common import torch_dtype_to_tl
-except ImportError:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from _common import torch_dtype_to_tl
+
+def torch_dtype_to_tl(dtype):
+    _map = {
+        torch.float16: "float16",
+        torch.float32: "float",
+        torch.bfloat16: "bfloat16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+    }
+    return _map[dtype]
+
 
 _kernel_cache = {}
 
@@ -390,11 +394,92 @@ def arg_max(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tenso
     return out
 
 
-if __name__ == "__main__":
-    import torch
+# ---------------------------------------------------------------------------
+# Test harness
+# ---------------------------------------------------------------------------
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+}
 
-    torch.manual_seed(0)
-    x = torch.randn(1024, 1024, dtype=torch.float32).npu()
-    y = arg_max(x, dim=-1)
-    torch.npu.synchronize()
-    print("Done")
+
+def _make_x(shape, dtype_str, value_range):
+    torch_dtype = _DTYPE_MAP[dtype_str]
+    lo, hi = value_range
+    if dtype_str in ("float16", "float32", "bfloat16"):
+        x = (torch.rand(shape, dtype=torch.float32) * (hi - lo) + lo).to(torch_dtype)
+    else:
+        x = torch.randint(int(lo), int(hi) + 1, shape, dtype=torch_dtype)
+    return x.npu()
+
+
+def run_arg_max(case_id, shape, dtype_str, dim, keepdim, value_range):
+    x = _make_x(shape, dtype_str, value_range)
+    y = arg_max(x, dim=dim, keepdim=keepdim)
+    ref = torch.argmax(x, dim=dim, keepdim=keepdim)
+
+    if not torch.equal(y.cpu(), ref.cpu()):
+        max_diff = (y.cpu() != ref.cpu()).sum().item()
+        raise AssertionError(f"argmax mismatch: {max_diff} elements differ")
+
+    print(f"Case {case_id}: PASSED  (shape={shape}, dtype={dtype_str}, dim={dim}, keepdim={keepdim})")
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+    test_cases = [
+        (1, [1024, 1024], "float16", -1, False, [-1, 1]),
+        (2, [2048, 2048], "float32", -1, False, [-2, 2]),
+        (3, [4096, 4096], "bfloat16", -1, False, [-3, 3]),
+        (4, [8192, 8192], "int32", -1, False, [-1000, 1000]),
+        (5, [4096, 4096], "int64", -1, False, [-100000, 100000]),
+        (6, [1024, 1024], "float16", 0, False, [-1, 1]),
+        (7, [2048, 2048], "float32", 0, True, [-2, 2]),
+        (8, [4096, 4096], "bfloat16", 1, True, [-3, 3]),
+        (9, [1023, 1023], "float16", -1, False, [-1, 1]),
+        (10, [1009, 1021], "float32", 0, False, [-1, 2]),
+        (11, [1537, 769], "bfloat16", 1, False, [-5, 10]),
+        (12, [363, 367, 373], "float16", 1, False, [-50, 100]),
+        (13, [363, 367, 373], "float16", 2, True, [-50, 100]),
+        (14, [363, 367, 373], "float32", 0, False, [-1, 1]),
+        (15, [3, 7, 13, 4001], "bfloat16", 1, False, [-88, 88]),
+        (16, [3, 7, 13, 4001], "float32", 3, True, [-1, 1]),
+        (17, [3, 7, 13, 4001], "float16", 0, False, [-1, 1]),
+        (18, [1000003], "float32", 0, False, [-100, 100]),
+        (19, [1000003], "float16", 0, False, [-1, 1]),
+        (20, [11, 13, 17, 67, 67], "bfloat16", 1, True, [-88, 88]),
+        (21, [512, 2049], "bfloat16", -1, False, [-0.5, 0.5]),
+        (22, [255, 8193], "float16", 0, False, [-1, 3]),
+        (23, [4097, 511], "float32", -1, False, [-1000, 1000]),
+        (24, [2, 511, 2049], "bfloat16", 1, True, [-0.2, 0.2]),
+        (25, [4, 255, 2049], "float32", 2, False, [-3, 6]),
+        (26, [32, 64], "int32", -1, False, [-100, 100]),
+        (27, [32, 64], "int64", 0, True, [-100, 100]),
+        (28, [1, 1024], "float16", -1, False, [-1, 1]),
+        (29, [1, 1024], "float32", 0, True, [-1, 1]),
+        (30, [1024, 1], "bfloat16", -1, False, [-1, 1]),
+    ]
+
+    print("=" * 70)
+    print("ArgMax TileLang-Ascend 测试 (torch.argmax 语义)")
+    print(f"共 {len(test_cases)} 个测试用例")
+    print("=" * 70)
+
+    passed = 0
+    failed = 0
+    for case_id, shape, dtype, dim, keepdim, value_range in test_cases:
+        try:
+            run_arg_max(case_id, shape, dtype, dim, keepdim, value_range)
+            passed += 1
+        except Exception as e:
+            print(f"Case {case_id}: FAILED - {e}")
+            failed += 1
+
+    print("=" * 70)
+    print(f"测试完成: {passed} passed, {failed} failed")
+    if failed == 0:
+        print("Test Passed!")
